@@ -42,24 +42,77 @@ STATEMENT_TIMEOUT_MS = 120000
 # is "<role>.<project-ref>", never a bare role.
 _POOLER_REF = re.compile(r"^[a-z0-9]{20}$")
 _DIRECT_HOST = re.compile(r"^db\.[a-z0-9]+\.supabase\.co$")
-_SMOKE_TRUTHY = {"1", "true", "yes"}
+_FLAG_TRUTHY = {"1", "true", "yes"}
+
+
+def flag_truthy(value):
+    """True for 1/true/yes. None, empty, and every other string are false."""
+    if value is None:
+        return False
+    return str(value).strip().lower() in _FLAG_TRUTHY
 
 
 def smoke_enabled(value=None):
-    """True only for DISCOVER_SMOKE=1/true/yes. Unset and false stay disarmed."""
+    """True when DISCOVER_SMOKE is 1/true/yes.
+
+    Deprecated alias of DISCOVER_TEST. It only labels the run as a one-shot
+    test. It does not arm or skip the harvest. Cron runs with it unset.
+    """
     if value is None:
         value = os.getenv("DISCOVER_SMOKE")
-    if value is None:
-        return False
-    return value.strip().lower() in _SMOKE_TRUTHY
+    return flag_truthy(value)
 
 
-def disarmed():
-    """Log and return True when this process must exit without mint work."""
-    if smoke_enabled():
-        return False
-    log.info("DISCOVER_SMOKE unset; skip run")
-    return True
+def test_enabled():
+    """True when this start should be labeled a one-shot test.
+
+    DISCOVER_TEST is the switch. DISCOVER_SMOKE is the deprecated alias.
+    Neither flag is required for a scheduled paper harvest.
+    """
+    return flag_truthy(os.getenv("DISCOVER_TEST")) or smoke_enabled()
+
+
+def run_mode():
+    """'test' for a one-shot label, otherwise 'cron'."""
+    return "test" if test_enabled() else "cron"
+
+
+def log_run_start():
+    """Loud start line: cron vs test, always paper, never a secret."""
+    mode = run_mode()
+    if mode == "test":
+        if flag_truthy(os.getenv("DISCOVER_TEST")):
+            via = "DISCOVER_TEST"
+        else:
+            via = "DISCOVER_SMOKE (deprecated alias of DISCOVER_TEST)"
+        log.info(
+            "run start mode=test paper=true via=%s; "
+            "ONE-SHOT TEST paper harvest, running once then exit",
+            via,
+        )
+    else:
+        log.info(
+            "run start mode=cron paper=true; "
+            "scheduled paper harvest once then exit "
+            "(DISCOVER_TEST unset; DISCOVER_SMOKE is not required)"
+        )
+    return mode
+
+
+def configure_logging():
+    """INFO on stdout, flushed per record, so Railway shows harvest progress.
+
+    logging.basicConfig writes to stderr, and Railway tags stderr as errors.
+    StreamHandler.emit flushes after each line. The image also sets
+    PYTHONUNBUFFERED=1; set that when running outside Docker.
+    """
+    handler = logging.StreamHandler(stream=sys.stdout)
+    handler.setLevel(logging.INFO)
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
 
 
 def ipv4_addresses(host):
@@ -259,7 +312,7 @@ def connect_supabase(host, port, user, password, dbname, resolve=None,
         tried.append(addr)
         # Host, port, user, and address only. The password is never logged.
         log.info(
-            "Connecting host=%s port=%s user=%s hostaddr=%s",
+            "connect attempt host=%s port=%s user=%s hostaddr=%s",
             host, port, user, addr,
         )
         try:
@@ -288,7 +341,10 @@ def connect_supabase(host, port, user, password, dbname, resolve=None,
             raise RuntimeError(
                 connect_failure_message(host, port, user, tried, exc)
             ) from exc
-        log.info("Connected host=%s port=%s hostaddr=%s", host, port, addr)
+        log.info(
+            "connected host=%s port=%s user=%s hostaddr=%s",
+            host, port, user, addr,
+        )
         if prepare is not None:
             try:
                 prepare(conn)
@@ -373,6 +429,26 @@ def dig(x, *p):
     return x
 
 
+def _keep_trader(trader):
+    if not isinstance(trader, dict) or not trader.get("wallet"):
+        return False
+    realized = dec(dig(trader, "pnl", "token", "realized"))
+    return realized is not None and realized > 0
+
+
+def pagination_stop_reason(pagination, cursor, floor):
+    """Why this page ends the harvest. None means request the next page."""
+    if not pagination.get("hasMore"):
+        return "hasMore_false"
+    if not cursor:
+        return "no_cursor"
+    if floor is None:
+        return "no_floor"
+    if floor < REALIZED_FLOOR_USD:
+        return "below_realized_floor"
+    return None
+
+
 def fetch(client, key, mint):
     out = []
     cursor = None
@@ -387,22 +463,25 @@ def fetch(client, key, mint):
         }
         if cursor:
             q["cursor"] = cursor
-        r = client.get(
-            f"{TRACKER_BASE}/v2/pnl/tokens/{quote(mint, safe='')}/traders",
-            params=q,
-            headers={"x-api-key": key},
-            timeout=45,
-        )
-        r.raise_for_status()
+        try:
+            r = client.get(
+                f"{TRACKER_BASE}/v2/pnl/tokens/{quote(mint, safe='')}/traders",
+                params=q,
+                headers={"x-api-key": key},
+                timeout=45,
+            )
+            r.raise_for_status()
+        except Exception as exc:
+            # Type only. httpx messages can echo the request, including the key.
+            log.error(
+                "tracker page=%s failed reason=%s",
+                page, type(exc).__name__,
+            )
+            raise
         body = r.json()
         traders = body.get("traders") or []
-        out.extend(
-            t for t in traders
-            if isinstance(t, dict)
-            and dec(dig(t, "pnl", "token", "realized")) is not None
-            and dec(dig(t, "pnl", "token", "realized")) > 0
-            and t.get("wallet")
-        )
+        kept = [t for t in traders if _keep_trader(t)]
+        out.extend(kept)
         pg = body.get("pagination") or {}
         floor = min(
             (
@@ -413,8 +492,17 @@ def fetch(client, key, mint):
             default=None,
         )
         cursor = pg.get("nextCursor")
-        if not pg.get("hasMore") or not cursor or floor is None or floor < REALIZED_FLOOR_USD:
+        has_more = bool(pg.get("hasMore"))
+        log.info(
+            "tracker page=%s kept=%s cumulative=%s hasMore=%s",
+            page, len(kept), len(out), has_more,
+        )
+        stop = pagination_stop_reason(pg, cursor, floor)
+        if stop:
+            log.info("tracker stop page=%s reason=%s", page, stop)
             break
+    else:
+        log.info("tracker stop page=%s reason=max_pages", page)
     return out, page
 
 
@@ -426,7 +514,11 @@ def run_harvest(conn, mint_override):
             (mint_override,),
         )
         if cur.fetchone():
-            log.info("mint=%s pages=0 upserted=0 tracker_calls=0 status=skip", mint_override)
+            log.info(
+                "mint=%s pages=0 upserted=0 tracker_calls=0 status=skip "
+                "reason=already_scanned",
+                mint_override,
+            )
             return 0
         cur.execute(
             "SELECT id,token_address,roi_multiple,detected_at "
@@ -451,12 +543,16 @@ def run_harvest(conn, mint_override):
         )
     choice = cur.fetchone()
     if not choice:
-        log.info("no unscanned mint; exit 0")
+        log.info("no unscanned mint; exit 0 reason=no_unscanned_mint")
         return 0
     oid, mint, roi, _detected = choice
+    log.info("mint selected mint=%s outcome_id=%s roi=%s", mint, oid, roi)
     key = os.getenv("SOLANA_TRACKER_API_KEY", "")
     if not key:
-        log.error("SOLANA_TRACKER_API_KEY is not set")
+        log.error(
+            "mint=%s status=error reason=SOLANA_TRACKER_API_KEY_unset",
+            mint,
+        )
         return 1
     with httpx.Client() as client:
         traders, pages = fetch(client, key, mint)
@@ -510,6 +606,7 @@ def run_harvest(conn, mint_override):
         (mint, oid, roi, pages, len(rows), green, status),
     )
     conn.commit()
+    log.info("upsert progress rows=%s green_usd=%s", len(rows), green)
     cur.execute(
         "INSERT INTO public.tracked_wallets "
         "(wallet_address,name,source,is_active,wallet_tier,notes) "
@@ -518,7 +615,12 @@ def run_harvest(conn, mint_override):
         "ON CONFLICT (wallet_address) DO UPDATE SET "
         "last_imported_at=now(),updated_at=now()"
     )
+    harvested = cur.rowcount
     conn.commit()
+    log.info(
+        "harvest summary rows=%s source=tracker_traders",
+        harvested,
+    )
     cur.execute(
         f"UPDATE public.tracked_wallets t SET is_active="
         f"(t.wallet_address IN ("
@@ -526,7 +628,12 @@ def run_harvest(conn, mint_override):
         f"ORDER BY n_won DESC,pnl_won DESC NULLS LAST LIMIT {PROMOTE_CAP}"
         f")),updated_at=now() WHERE t.source='tracker_traders'"
     )
+    promoted = cur.rowcount
     conn.commit()
+    log.info(
+        "promote summary cap=%s rows_updated=%s source=tracker_traders",
+        PROMOTE_CAP, promoted,
+    )
     log.info(
         "mint=%s pages=%s upserted=%s green_usd=%s status=%s",
         mint, pages, len(rows), green, status,
@@ -541,10 +648,12 @@ def main(argv=None):
     if matrix_enabled():
         log.info("MATRIX_RUN enabled; connect matrix only, no harvest")
         return run_matrix()
-    if disarmed():
-        return 0
-    log.info("DISCOVER_SMOKE enabled; running paper harvest once")
-    conn = connect()
+    log_run_start()
+    try:
+        conn = connect()
+    except Exception as exc:
+        log.error("connect failed reason=%s", type(exc).__name__)
+        raise
     try:
         return run_harvest(conn, mint_override)
     finally:
@@ -552,9 +661,9 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    configure_logging()
     try:
         sys.exit(main())
-    except Exception:
-        log.exception("unhandled")
+    except Exception as exc:
+        log.exception("unhandled reason=%s", type(exc).__name__)
         sys.exit(1)
