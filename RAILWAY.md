@@ -9,7 +9,7 @@ One Solana mint every 8 hours. Paper only: no swaps, no purchases, no live tradi
 3. Insert `wallet_intel.token_trader_scans` so that mint is never pulled again.
 4. Harvest repeat winners into `public.tracked_wallets` inactive, then promote at most 100 tracker wallets.
 
-Nothing in that list runs unless `DISCOVER_SMOKE` is truthy. See the sequence below.
+Each cron start runs that list once and exits. `DISCOVER_TEST` only labels a one-shot check; it does not gate the harvest. See the sequence below.
 
 **Start**
 
@@ -23,7 +23,8 @@ A cron service does **not** start on deploy or when a variable changes. Railway 
 
 - `SOLANA_TRACKER_API_KEY`
 - `SUPABASE_HOST`, `SUPABASE_PORT`, `SUPABASE_USER`, `SUPABASE_PASSWORD`, `SUPABASE_DBNAME`, or `DATABASE_URL`
-- `DISCOVER_SMOKE` — arming switch for the paper harvest (below)
+- `DISCOVER_TEST` — optional one-shot label (`1` / `true` / `yes`). Unset is the normal cron harvest. `DISCOVER_SMOKE` is a deprecated alias of `DISCOVER_TEST` and does not gate cron.
+- `PYTHONUNBUFFERED=1` — already set in the image. Logs are INFO on stdout (not stderr) and flushed per line. Do not rely on stderr, which Railway tags as errors.
 
 Apply `migrations/20260930_token_trader_harvest.sql` before the first real cron run.
 
@@ -45,24 +46,42 @@ The two crashed runs (`EAUTHQUERY` / `connection to database not available`) dia
 
 A failed connect raises a message that names the host, port, user, and hostaddrs tried, and says the failure is not the Tracker API.
 
-## `DISCOVER_SMOKE`
+## `DISCOVER_TEST`
+
+`DISCOVER_TEST` does not arm or disarm the harvest. Scheduled production runs with it unset.
 
 | Value | Behavior |
 | --- | --- |
-| unset, empty, `0`, `false`, `no` | Log `DISCOVER_SMOKE unset; skip run` and exit 0. No Postgres connection and no Tracker call. |
-| `1`, `true`, `yes` | Log `DISCOVER_SMOKE enabled; running paper harvest once`, run the paper harvest, exit. |
+| unset, empty, `0`, `false`, `no` | Cron mode. Log `run start mode=cron paper=true` and run one paper harvest, then exit. |
+| `1`, `true`, `yes` | One-shot test. Log `run start mode=test paper=true via=DISCOVER_TEST` and `ONE-SHOT TEST`, run one paper harvest, then exit. |
 
-The schedule does not bypass the switch. An 8-hour cron start harvests only while `DISCOVER_SMOKE` is truthy. Clearing the variable disarms the job and leaves the cron in place.
+`DISCOVER_SMOKE` is a deprecated alias with the same truthy set. If it is still `1` from the old arming switch, the run is labeled test (`via=DISCOVER_SMOKE (deprecated alias of DISCOVER_TEST)`) and still harvests. Unset it when you want cron lines to say `mode=cron`. Leaving both unset is the production cron setup.
 
-### Safe sequence
+Progress lines (stdout, INFO, flushed) look like:
 
-Service: **Successful Wallet Discovery** (Wallet Ops Core). Settings → Variables, and Settings → Cron Schedule. Redeploy is not required for a variable change, but a cron service still will not boot until the schedule fires or the schedule is cleared.
+```
+run start mode=test paper=true via=DISCOVER_TEST; ONE-SHOT TEST paper harvest, running once then exit
+connect attempt host=aws-0-us-west-2.pooler.supabase.com port=5432 user=postgres.<ref> hostaddr=54.70.143.232
+connected host=aws-0-us-west-2.pooler.supabase.com port=5432 user=postgres.<ref> hostaddr=54.70.143.232
+mint selected mint=<mint> outcome_id=123 roi=4.2
+tracker page=1 kept=12 cumulative=12 hasMore=True
+tracker stop page=2 reason=below_realized_floor
+upsert progress rows=20 green_usd=1500
+harvest summary rows=3 source=tracker_traders
+promote summary cap=100 rows_updated=100 source=tracker_traders
+mint=<mint> pages=2 upserted=20 green_usd=1500 status=ok
+```
 
-1. **Deploy inert.** Leave `DISCOVER_SMOKE` unset. Leave cron at `0 */8 * * *`. The next scheduled start logs `DISCOVER_SMOKE unset; skip run` and exits 0.
-2. **One real paper run now.** Set `DISCOVER_SMOKE=1`. Clear Cron Schedule (empty) and save. Railway starts the service immediately because it is no longer a cron service. Confirm logs show `DISCOVER_SMOKE enabled; running paper harvest once` and then either `mint=... status=...` or `no unscanned mint`. The process exits (restart NEVER). This is one mint, paper only.
-3. **Unattended harvests.** Set Cron Schedule back to `0 */8 * * *`. Leave `DISCOVER_SMOKE=1`. Each scheduled start runs one paper mint. To stop harvests without deleting the cron, clear `DISCOVER_SMOKE` (or set it to `0`). The next start logs `DISCOVER_SMOKE unset; skip run` and exits 0.
+Connect lines include host, port, user, and hostaddr only. A skip or failure names `reason=` (`already_scanned`, `no_unscanned_mint`, `SOLANA_TRACKER_API_KEY_unset`, `connect failed reason=...`). Tracker failures log the exception type, not the message, so the API key cannot be echoed.
 
-Do not clear the cron while `DISCOVER_SMOKE` is unset if you wanted a real run: the immediate start would still skip.
+### One-shot test, then cron
+
+Service: **Successful Wallet Discovery** (Wallet Ops Core). Settings → Variables, and Settings → Cron Schedule. Restart policy stays **NEVER**.
+
+1. **One-shot now.** Set `DISCOVER_TEST=1`. Redeploy. A cron service does not boot on deploy while a schedule is set, so clear Cron Schedule (empty) before that redeploy if you need the run immediately rather than at the next `0 */8 * * *` tick. Confirm logs show `mode=test`, `ONE-SHOT TEST`, then either `mint=... status=...` or `no unscanned mint`. The process exits. This is one mint, paper only.
+2. **Unattended harvests.** Unset `DISCOVER_TEST` (and unset `DISCOVER_SMOKE` if it is still present). Set Cron Schedule back to `0 */8 * * *`. Each scheduled start runs one paper mint and logs `mode=cron`. No smoke flag is required.
+
+`MATRIX_RUN=1` still runs the connect matrix only, even when `DISCOVER_TEST` is set.
 
 ## Connect matrix (one shot)
 
@@ -104,12 +123,12 @@ Each line is `CASE id=... result=PASS|FAIL|SKIP host=... port=... user=... famil
 
 Service: **Successful Wallet Discovery**. Start command stays `python discover.py` (`python connect_matrix.py` is the same matrix). Restart policy stays **NEVER**.
 
-1. Leave `DISCOVER_SMOKE` unset. A matrix run does not harvest even if the smoke switch is on.
+1. A matrix run does not harvest, even if `DISCOVER_TEST` or `DISCOVER_SMOKE` is set.
 2. Set `MATRIX_RUN=1`. Password is `SUPABASE_PASSWORD` or `SUPABASE_DB_PASSWORD` (already on the service). Do not put the password in the start command.
 3. Clear Cron Schedule (empty) and save so this starts immediately. An 8-hour cron must not be left on while `MATRIX_RUN=1`, or every tick will dial the pooler again.
 4. Read the log. A pass is one `WINNER` line and exit 0. No pass is `NO_WINNER` and exit 1. Empty password is exit 2 and does not dial. `MATRIX_ENUMERATE=1` prints the case list and does not dial, if the circuit breaker is still hot and you only want the plan.
 5. Copy `CONNECT_MODE`, `SUPABASE_HOST`, `SUPABASE_PORT`, and `SUPABASE_USER` from the `WINNER` line into the service variables. Leave the password where it is.
-6. Unset `MATRIX_RUN` (and `MATRIX_ENUMERATE`). Then follow the `DISCOVER_SMOKE` sequence above for one paper mint, and only then put cron back to `0 */8 * * *`.
+6. Unset `MATRIX_RUN` (and `MATRIX_ENUMERATE`). Then follow the `DISCOVER_TEST` sequence above for one paper mint, and only then put cron back to `0 */8 * * *` with `DISCOVER_TEST` unset.
 
 Preferred shape when session mode is the winner (no secret in this file):
 

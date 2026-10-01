@@ -521,7 +521,7 @@ def winner_example(case, dbname):
         f"SUPABASE_DBNAME={dbname}",
         "# SUPABASE_PASSWORD=",
         f"# family={case.family} hostaddr={case.hostaddr} case={case.id}",
-        "# Clear MATRIX_RUN before turning cron back on. Then set DISCOVER_SMOKE=1.",
+        "# Clear MATRIX_RUN before turning cron back on. Cron harvests with DISCOVER_TEST unset.",
         "",
     ))
     for line in text.splitlines():
