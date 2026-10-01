@@ -1,0 +1,8 @@
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "python discover.py"
+cronSchedule = "0 */8 * * *"
+restartPolicyType = "NEVER"

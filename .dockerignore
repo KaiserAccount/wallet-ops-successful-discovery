@@ -1,0 +1,10 @@
+__pycache__
+*.pyc
+.env
+.env.*
+!.env.example
+.venv
+.pytest_cache
+.git
+test_discover.py
+migrations
