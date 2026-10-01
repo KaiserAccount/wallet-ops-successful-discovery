@@ -144,5 +144,80 @@ class ConnectShapeTest(unittest.TestCase):
         self.assertNotIn("secret", str(raised.exception))
 
 
+class ConnectModeTest(unittest.TestCase):
+    def test_transaction_mode_allows_6543(self):
+        host, user = discover.validate_endpoint(
+            "aws-0-us-west-2.pooler.supabase.com",
+            6543,
+            "postgres.trzfysszmrgogpeitzfk",
+            ["1.1.1.1"],
+            mode="transaction-pooler",
+        )
+        self.assertEqual(host, "aws-0-us-west-2.pooler.supabase.com")
+        self.assertEqual(user, "postgres.trzfysszmrgogpeitzfk")
+
+    def test_direct_ipv6_dials_the_aaaa_address(self):
+        seen = {}
+
+        def connect(**kwargs):
+            seen.update(kwargs)
+            return mock.Mock()
+
+        discover.connect_supabase(
+            "db.trzfysszmrgogpeitzfk.supabase.co",
+            5432,
+            "postgres",
+            "secret",
+            "postgres",
+            resolve=lambda _host: ["2600::1"],
+            connect=connect,
+            prepare=None,
+            mode="direct-ipv6",
+        )
+        self.assertEqual(seen["hostaddr"], "2600::1")
+        self.assertEqual(seen["user"], "postgres")
+        self.assertNotIn("secret", repr({k: v for k, v in seen.items() if k != "password"}))
+
+    def test_https_host_is_rejected_before_dial(self):
+        env = {
+            "SUPABASE_HOST": "https://trzfysszmrgogpeitzfk.supabase.co",
+            "SUPABASE_USER": "postgres.trzfysszmrgogpeitzfk",
+            "SUPABASE_PASSWORD": "secret",
+            "CONNECT_MODE": "session-pooler",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            with mock.patch("discover.connect_supabase") as connect:
+                with self.assertRaises(RuntimeError) as raised:
+                    discover.connect()
+                connect.assert_not_called()
+        self.assertIn("HTTP API", str(raised.exception))
+        self.assertNotIn("secret", str(raised.exception))
+
+    def test_db_password_fallback_is_passed_through(self):
+        env = {
+            "SUPABASE_HOST": "aws-0-us-west-2.pooler.supabase.com",
+            "SUPABASE_PORT": "5432",
+            "SUPABASE_USER": "archiver.trzfysszmrgogpeitzfk",
+            "SUPABASE_DB_PASSWORD": "from-db-password",
+            "CONNECT_MODE": "session-pooler",
+        }
+        with mock.patch.dict(os.environ, env, clear=False):
+            os.environ.pop("SUPABASE_PASSWORD", None)
+            with mock.patch("discover.connect_supabase", return_value=mock.Mock()) as connect:
+                discover.connect()
+        self.assertEqual(connect.call_args.args[3], "from-db-password")
+        self.assertEqual(connect.call_args.kwargs["mode"], "session-pooler")
+
+    def test_matrix_run_does_not_harvest(self):
+        with mock.patch.dict(os.environ, {"MATRIX_RUN": "1", "DISCOVER_SMOKE": "1"}):
+            with mock.patch("discover.run_matrix", return_value=0) as run_matrix:
+                with mock.patch("discover.connect") as connect:
+                    with self.assertLogs("discover", level="INFO") as captured:
+                        self.assertEqual(discover.main([]), 0)
+        connect.assert_not_called()
+        run_matrix.assert_called_once()
+        self.assertTrue(any("no harvest" in line for line in captured.output))
+
+
 if __name__ == "__main__":
     unittest.main()

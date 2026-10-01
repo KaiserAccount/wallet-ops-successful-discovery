@@ -17,6 +17,15 @@ import psycopg2
 from dotenv import load_dotenv
 from psycopg2.extras import execute_values
 
+from connect_matrix import (
+    addresses_for_mode,
+    database_password,
+    matrix_enabled,
+    normalize_mode,
+    reject_http_api_host,
+    run_matrix,
+)
+
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 log = logging.getLogger("discover")
@@ -72,13 +81,19 @@ def _pooler_user_ok(user):
     return bool(dot and role and _POOLER_REF.match(ref))
 
 
-def validate_endpoint(host, port, user, addrs):
+def validate_endpoint(host, port, user, addrs, mode="session-pooler"):
     """Reject shapes that cannot work on Railway before any login attempt.
 
     A bad username still reaches Supavisor and can open the auth circuit
     breaker, so this fails closed without dialing.
+
+    ``mode`` is the CONNECT_MODE strategy. The default session-pooler keeps
+    port 6543 and a bare pooler role rejected. transaction-pooler allows
+    6543. direct and direct-ipv6 allow the AAAA-only db host when an
+    address was actually resolved.
     """
-    if port == TRANSACTION_MODE_PORT:
+    mode = normalize_mode(mode)
+    if mode == "session-pooler" and port == TRANSACTION_MODE_PORT:
         raise RuntimeError(
             "SUPABASE_PORT=6543 is the transaction pooler. "
             "This job needs session mode: set SUPABASE_PORT=5432 and "
@@ -88,6 +103,14 @@ def validate_endpoint(host, port, user, addrs):
             "SUPABASE_USER must be <role>.<project-ref>."
         )
     if not addrs:
+        if mode in {"direct", "direct-ipv6"}:
+            raise RuntimeError(
+                f"No address for {host} in CONNECT_MODE={mode}. "
+                "db.<project-ref>.supabase.co is often AAAA-only. "
+                "direct-ipv6 needs a working IPv6 route. "
+                "session-pooler uses aws-<n>-<region>.pooler.supabase.com "
+                "port 5432 and SUPABASE_USER=<role>.<project-ref>."
+            )
         if _DIRECT_HOST.match(host):
             raise RuntimeError(
                 f"No IPv4 address for {host}. "
@@ -208,15 +231,19 @@ def _apply_session(conn):
     return conn
 
 
-def connect_supabase(host, port, user, password, dbname, resolve=ipv4_addresses,
-                     connect=None, prepare=_apply_session):
-    """Open one session-mode Postgres connection over IPv4.
+def connect_supabase(host, port, user, password, dbname, resolve=None,
+                     connect=None, prepare=_apply_session, mode=None):
+    """Open one Postgres connection for the CONNECT_MODE strategy.
 
-    host= is the TLS/SNI name. hostaddr= is the A record libpq dials, so
-    Railway never follows an AAAA for db.<ref>.supabase.co. Keyword
-    arguments are used so a URL parser cannot truncate postgres.<ref>.
+    host= is the TLS/SNI name. hostaddr= is the address libpq dials, so a
+    session-pooler connect never follows an AAAA for db.<ref>.supabase.co.
+    Keyword arguments are used so a URL parser cannot truncate postgres.<ref>.
+    direct-ipv6 passes AAAA addresses. The password is never logged.
     """
     connect = connect or psycopg2.connect
+    mode = normalize_mode(mode if mode is not None else os.getenv("CONNECT_MODE"))
+    if resolve is None:
+        resolve = lambda host, _mode=mode: addresses_for_mode(host, _mode)
     host = host.strip().rstrip(".").lower()
     user = user.strip()
     if password is None or password == "":
@@ -224,7 +251,7 @@ def connect_supabase(host, port, user, password, dbname, resolve=ipv4_addresses,
             "SUPABASE_PASSWORD is empty. Refusing to attempt a pooler login."
         )
     addrs = list(resolve(host))
-    host, user = validate_endpoint(host, port, user, addrs)
+    host, user = validate_endpoint(host, port, user, addrs, mode=mode)
 
     last_exc = None
     tried = []
@@ -254,7 +281,7 @@ def connect_supabase(host, port, user, password, dbname, resolve=ipv4_addresses,
             last_exc = exc
             if addr != addrs[-1] and pooler_node_unavailable(exc):
                 log.info(
-                    "IPv4 %s unavailable (%s); trying next A record",
+                    "address %s unavailable (%s); trying next",
                     addr, str(exc).strip().splitlines()[0][:240],
                 )
                 continue
@@ -300,16 +327,27 @@ def split_database_url(url):
 
 
 def connect():
+    mode = normalize_mode(os.getenv("CONNECT_MODE"))
     host = os.getenv("SUPABASE_HOST", "").strip()
     if host:
+        host = reject_http_api_host(host)
         port = int(os.getenv("SUPABASE_PORT", str(SESSION_MODE_PORT)))
         try:
             user = os.environ["SUPABASE_USER"]
-            password = os.environ["SUPABASE_PASSWORD"]
         except KeyError as exc:
             raise RuntimeError(f"{exc.args[0]} is not set") from exc
+        password = database_password()
+        if not password:
+            if (
+                "SUPABASE_PASSWORD" not in os.environ
+                and "SUPABASE_DB_PASSWORD" not in os.environ
+            ):
+                raise RuntimeError("SUPABASE_PASSWORD is not set")
+            raise RuntimeError(
+                "SUPABASE_PASSWORD is empty. Refusing to attempt a pooler login."
+            )
         dbname = os.getenv("SUPABASE_DBNAME", "postgres").strip() or "postgres"
-        return connect_supabase(host, port, user, password, dbname)
+        return connect_supabase(host, port, user, password, dbname, mode=mode)
     url = os.getenv("DATABASE_URL") or os.getenv("SUPABASE_DB_URL") or ""
     if not url:
         raise RuntimeError(
@@ -317,7 +355,7 @@ def connect():
             "SUPABASE_PASSWORD, and SUPABASE_DBNAME, or DATABASE_URL"
         )
     host, port, user, password, dbname = split_database_url(url)
-    return connect_supabase(host, port, user, password, dbname)
+    return connect_supabase(host, port, user, password, dbname, mode=mode)
 
 
 def dec(x):
@@ -500,6 +538,9 @@ def main(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--mint", default=os.getenv("DISCOVER_MINT"))
     mint_override = ap.parse_args(argv).mint
+    if matrix_enabled():
+        log.info("MATRIX_RUN enabled; connect matrix only, no harvest")
+        return run_matrix()
     if disarmed():
         return 0
     log.info("DISCOVER_SMOKE enabled; running paper harvest once")
