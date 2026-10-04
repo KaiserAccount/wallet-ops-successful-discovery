@@ -2,9 +2,9 @@
 
 **What this service does**
 
-The top ROI quintile of Solana success mints, every 8 hours. Paper only: no swaps, no purchases, no live trading.
+Every 8 hours, harvest the top 20% of distinct tokens whose outcomes are within the last 10 hours. Paper only: no swaps, no purchases, no live trading.
 
-1. Rank distinct success mints in `wallet_intel.telegram_call_outcomes` by `roi_multiple` and take the top 20% (`DISCOVER_TOP_FRACTION`, default `0.20`).
+1. Keep `wallet_intel.telegram_call_outcomes` rows with `detected_at` inside the last 10 hours (`DISCOVER_WINDOW_HOURS`, default `10`). Collapse to one row per token (highest `roi_multiple`, then latest `detected_at`, then highest `id`) before the cut. Take the top 20% of that distinct list (`DISCOVER_TOP_FRACTION`, default `0.20`).
 2. Skip mints already ledgered `ok` or `empty` unless `DISCOVER_RESCAN` is set. `status=error` stays eligible.
 3. For each chosen mint, call Solana Tracker traders and upsert profitable wallets into `wallet_intel.wallet_token_positions`. One mint's failure is logged and skipped.
 4. Insert or update `wallet_intel.token_trader_scans` (`ok`, `empty`, or `error`).
@@ -14,7 +14,7 @@ Each cron start runs that list once and exits. `DISCOVER_TEST` only labels a one
 
 **Start**
 
-- Cron: `0 */8 * * *` (UTC)
+- Cron: `0 */8 * * *` (UTC). This schedule does not change. The selection window is 10 hours, so it overlaps the previous run by about 2 hours.
 - Command: `python discover.py`
 - Restart policy: **NEVER**
 
@@ -25,7 +25,8 @@ A cron service does **not** start on deploy or when a variable changes. Railway 
 - `SOLANA_TRACKER_API_KEY`
 - `SUPABASE_HOST`, `SUPABASE_PORT`, `SUPABASE_USER`, `SUPABASE_PASSWORD`, `SUPABASE_DBNAME`, or `DATABASE_URL`
 - `DISCOVER_TEST` — optional one-shot label (`1` / `true` / `yes`). Unset is the normal cron harvest. `DISCOVER_SMOKE` is a deprecated alias of `DISCOVER_TEST` and does not gate cron.
-- `DISCOVER_TOP_FRACTION` — optional. Default `0.20` (top quintile). `1` is the whole ranked set. `20` and `20%` are the same as `0.20`.
+- `DISCOVER_TOP_FRACTION` — optional. Default `0.20` (top quintile of the window). `1` is every distinct token in the window. `20` and `20%` are the same as `0.20`.
+- `DISCOVER_WINDOW_HOURS` — optional. Default `10`. Outcomes older than this are not ranked. `10h` is the same as `10`.
 - `DISCOVER_RESCAN` — optional (`1` / `true` / `yes`). Unset skips mints ledgered `ok` or `empty`.
 - `PYTHONUNBUFFERED=1` — already set in the image. Logs are INFO and ERROR on stdout (not stderr) and flushed per line. Do not rely on stderr, which Railway tags as errors.
 
@@ -66,7 +67,7 @@ Progress lines (stdout, INFO, flushed) look like:
 run start mode=test paper=true via=DISCOVER_TEST; ONE-SHOT TEST paper harvest of the top ROI quintile, running once then exit
 connect attempt host=aws-0-us-west-2.pooler.supabase.com port=5432 user=postgres.<ref> hostaddr=54.70.143.232
 connected host=aws-0-us-west-2.pooler.supabase.com port=5432 user=postgres.<ref> hostaddr=54.70.143.232
-batch selected ranked=40 quintile=8 chosen=8 fraction=0.2 rescan=false
+batch selected ranked=40 quintile=8 chosen=8 fraction=0.2 window_hours=10 rescan=false
 mint selected mint=<mint> outcome_id=123 roi=4.2
 tracker page=1 kept=12 cumulative=12 hasMore=True
 tracker stop page=2 reason=below_realized_floor
@@ -82,15 +83,21 @@ Connect lines include host, port, user, and hostaddr only. A skip or failure nam
 
 ## Top 20%
 
-**Definition.** Distinct Solana success mints in `wallet_intel.telegram_call_outcomes`, ranked by `roi_multiple` descending, then `detected_at` descending, then `id` descending. A mint qualifies when `chain` is null or starts with `sol` (`left(lower(chain), 3) = 'sol'`), `COALESCE(is_success, roi_multiple >= 2)` is true, `roi_multiple >= 2`, and `token_address` is not null. One row per mint: the highest-ROI outcome. The batch is `ceil(N × DISCOVER_TOP_FRACTION)` of that ranked list, at least 1 when N ≥ 1. Default fraction `0.20`.
+**Definition.** A run is the top 20% of distinct tokens whose outcomes are within the last 10 hours.
 
-Completed ledger rows (`token_trader_scans.status` of `ok` or `empty`) inside that window are skipped unless `DISCOVER_RESCAN` is set. `error` stays in the window so a failed mint can be retried next cron without a rescan flag. If the whole window is already `ok` or `empty`, the process logs `reason=top_quintile_already_scanned` and exits 0. Mints below the quintile are not harvested on that run.
+Those rows are Solana successes in `wallet_intel.telegram_call_outcomes` with `detected_at >= now() - window`. A row qualifies when `chain` is null or starts with `sol` (`left(lower(chain), 3) = 'sol'`), `COALESCE(is_success, roi_multiple >= 2)` is true, `roi_multiple >= 2`, and `token_address` is not null. `detected_at` null is outside the window. The cron stays `0 */8 * * *`. Default window is 10 hours (`DISCOVER_WINDOW_HOURS`).
+
+`telegram_call_outcomes` can store several rows for one mint. Collapse to one row per token after the time filter and before the 20% cut, so duplicates cannot inflate N or harvest the same mint twice. The kept row is the strongest outcome inside the window: `roi_multiple` descending, then `detected_at` descending, then `id` descending. An older outcome, including a higher ROI from outside the window, does not represent the token.
+
+The batch is `ceil(N × DISCOVER_TOP_FRACTION)` of that distinct list, at least 1 when N ≥ 1. Default fraction `0.20`.
+
+Completed ledger rows (`token_trader_scans.status` of `ok` or `empty`) inside that quintile are skipped unless `DISCOVER_RESCAN` is set. `error` stays eligible so a failed mint can be retried next cron without a rescan flag. If the whole quintile is already `ok` or `empty`, the process logs `reason=top_quintile_already_scanned` and exits 0. If every fetched outcome is outside the window, it logs `reason=outside_window` and exits 0. Tokens below the quintile are not harvested on that run.
 
 **Why this ranking.** It is the order the job already used (`ORDER BY roi_multiple DESC LIMIT 1`). Checked and not used as the mint rank:
 
 | Source | What it ranks | Why it is not the quintile |
 | --- | --- | --- |
-| `telegram_call_outcomes.roi_multiple` | Success-book mints | This is the quintile. |
+| `telegram_call_outcomes.roi_multiple` | Distinct tokens inside the last 10 hours | This is the quintile. |
 | Solana Tracker traders (`sort=realized`) | Wallets inside one mint, by realized PnL, with a $50 floor | Applied after the mint is chosen. |
 | Tracker `/tokens/volume` and `/tokens/trending` | About 100 tokens by volume; pool objects include liquidity | A different universe from the success book. Not stored by this job. |
 | `wallet_intel.v_repeat_winners` (`n_won`, `pnl_won`) | Wallets for the promote cap of 100 | Does not choose mints. Inserts stay `is_active=false` until this view's existing rule turns them on. |

@@ -15,6 +15,7 @@ import re
 import socket
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -41,8 +42,10 @@ TRACKER_BASE = "https://data.solanatracker.io"
 PAGE_LIMIT, MAX_PAGES = 20, 23
 REALIZED_FLOOR_USD = Decimal("50")
 PROMOTE_CAP = 100
-# Leading quintile of the success book. DISCOVER_TOP_FRACTION overrides this.
+# Leading quintile of the rolling success window. DISCOVER_TOP_FRACTION overrides this.
 DEFAULT_TOP_FRACTION = 0.20
+# Outcomes older than this are outside the batch. DISCOVER_WINDOW_HOURS overrides it.
+DEFAULT_WINDOW_HOURS = 10
 # One retry after the first attempt. Enough for a blip, not a hung mint.
 RETRY_ATTEMPTS = 2
 RETRY_BASE_SEC = 0.5
@@ -103,8 +106,108 @@ def rescan_enabled(value=None):
     return flag_truthy(value)
 
 
+def window_hours(value=None):
+    """How many hours of outcomes a run ranks. Default 10.
+
+    DISCOVER_WINDOW_HOURS accepts 10 or 10h. Zero, negative, and non-numeric
+    values log a warning and use 10. The cron stays every 8 hours; the window
+    is longer so a token that appears just after a run is still visible next time.
+    """
+    if value is None:
+        value = os.getenv("DISCOVER_WINDOW_HOURS")
+    if value is None or str(value).strip() == "":
+        return DEFAULT_WINDOW_HOURS
+    raw = str(value).strip().lower()
+    if raw.endswith("h"):
+        raw = raw[:-1].strip()
+    try:
+        number = float(raw)
+    except ValueError:
+        log.warning(
+            "DISCOVER_WINDOW_HOURS invalid value; using %s",
+            DEFAULT_WINDOW_HOURS,
+        )
+        return DEFAULT_WINDOW_HOURS
+    if not math.isfinite(number) or number <= 0:
+        log.warning(
+            "DISCOVER_WINDOW_HOURS out of range; using %s",
+            DEFAULT_WINDOW_HOURS,
+        )
+        return DEFAULT_WINDOW_HOURS
+    return number
+
+
+def _as_utc(value):
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def outcome_in_window(detected_at, now, hours):
+    """True when detected_at is inside the last `hours` hours, inclusive."""
+    stamp = _as_utc(detected_at)
+    moment = _as_utc(now)
+    if stamp is None or moment is None:
+        return False
+    return stamp >= moment - timedelta(hours=float(hours))
+
+
+def _rank_key(row):
+    """Best-first key: higher roi_multiple, then later detected_at, then higher id."""
+    roi = row[2]
+    if isinstance(roi, Decimal):
+        roi_value = roi
+        roi_known = True
+    elif roi is None or isinstance(roi, bool):
+        roi_value = Decimal(0)
+        roi_known = False
+    else:
+        try:
+            roi_value = Decimal(str(roi))
+            roi_known = True
+        except Exception:
+            roi_value = Decimal(0)
+            roi_known = False
+    detected = _as_utc(row[3])
+    identity = row[0] if isinstance(row[0], int) else 0
+    return (
+        roi_known,
+        roi_value,
+        detected is not None,
+        detected or datetime.min.replace(tzinfo=timezone.utc),
+        identity,
+    )
+
+
+def collapse_outcomes(rows, now, hours):
+    """One row per token inside the rolling window, strongest outcome first.
+
+    Rows are (outcome_id, token_mint, roi_multiple, detected_at, scan_status).
+    Outcomes with no detected_at, and outcomes older than `hours`, are dropped
+    before the collapse. Duplicate outcomes for one mint cannot inflate the
+    set: the kept row is the highest roi_multiple, then the latest detected_at,
+    then the highest id. The returned list is ranked the same way, before the
+    quintile cut.
+    """
+    best = {}
+    for row in rows:
+        if not row or len(row) < 5 or not row[1]:
+            continue
+        if not outcome_in_window(row[3], now, hours):
+            continue
+        mint = row[1]
+        current = best.get(mint)
+        if current is None or _rank_key(row) > _rank_key(current):
+            best[mint] = tuple(row)
+    ranked = list(best.values())
+    ranked.sort(key=_rank_key, reverse=True)
+    return ranked
+
+
 def top_fraction(value=None):
-    """Fraction of the ranked success book to harvest. Default 0.20.
+    """Fraction of the ranked in-window tokens to harvest. Default 0.20.
 
     Accepts 0.20, 20%, or 20 (numbers greater than 1 are percents).
     1 means the whole ranked set. Invalid values log a warning and use 0.20.
@@ -153,11 +256,11 @@ def choose_batch(ranked_rows, fraction, rescan):
     ok and empty are completed. error is not, so that mint stays eligible.
     """
     size = quintile_size(len(ranked_rows), fraction)
-    window = list(ranked_rows[:size])
+    leading = list(ranked_rows[:size])
     if rescan:
-        return window
+        return leading
     chosen = []
-    for row in window:
+    for row in leading:
         status = row[-1]
         if status in COMPLETED_SCAN_STATUSES:
             continue
@@ -735,9 +838,9 @@ def fetch(client, key, mint, sleep=None):
     return out, page
 
 
-# Best ranking already on the success book: roi_multiple, then recency, then id.
-# One row per mint (the highest ROI outcome). Tracker realized PnL ranks
-# traders inside a mint after this choice; it is not a mint rank.
+# Rolling window, then one row per mint, then roi_multiple. The DISTINCT ON
+# runs after the time filter, so an older higher-ROI outcome cannot represent
+# the token. Tracker realized PnL ranks traders inside a mint after this choice.
 RANKED_MINTS_SQL = (
     "SELECT r.id, r.token_address, r.roi_multiple, r.detected_at, s.status "
     "FROM ("
@@ -747,6 +850,7 @@ RANKED_MINTS_SQL = (
     "WHERE (o.chain IS NULL OR left(lower(o.chain), 3) = 'sol') "
     "AND COALESCE(o.is_success, o.roi_multiple >= 2) = true "
     "AND o.roi_multiple >= 2 AND o.token_address IS NOT NULL "
+    "AND o.detected_at >= now() - (%s * interval '1 hour') "
     "ORDER BY o.token_address, o.roi_multiple DESC NULLS LAST, "
     "o.detected_at DESC NULLS LAST, o.id DESC"
     ") r "
@@ -975,8 +1079,13 @@ def harvest_one(conn, cur, key, outcome_id, mint, roi, sleep=None):
         return "error"
 
 
-def select_mints(cur, mint_override, fraction, rescan, sleep=None):
-    """Return (chosen_rows, ranked_count). Empty chosen means exit 0."""
+def select_mints(cur, mint_override, fraction, rescan, sleep=None, now=None):
+    """Return (chosen_rows, ranked_count). Empty chosen means exit 0.
+
+    The scheduled batch is the top fraction of distinct tokens whose outcomes
+    fall inside the rolling window (default 10 hours). Collapse happens before
+    the cut. A mint override still targets that one mint.
+    """
     if mint_override:
         def _status():
             cur.execute(
@@ -1012,13 +1121,22 @@ def select_mints(cur, mint_override, fraction, rescan, sleep=None):
             return [], 0
         return [choice + (status,)], 1
 
+    hours = window_hours()
+    moment = now or datetime.now(timezone.utc)
+
     def _ranked():
-        cur.execute(RANKED_MINTS_SQL)
+        cur.execute(RANKED_MINTS_SQL, (hours,))
         return cur.fetchall()
 
-    ranked = list(retry_call(_ranked, sleep=sleep, label="ranked mints"))
+    fetched = list(retry_call(_ranked, sleep=sleep, label="ranked mints"))
+    # SQL already collapses and applies the window. Collapse again so a
+    # duplicate outcome cannot inflate the quintile if it reaches this list.
+    ranked = collapse_outcomes(fetched, moment, hours)
     if not ranked:
-        log.info("no unscanned mint; exit 0 reason=no_unscanned_mint")
+        if fetched:
+            log.info("no unscanned mint; exit 0 reason=outside_window")
+        else:
+            log.info("no unscanned mint; exit 0 reason=no_unscanned_mint")
         return [], 0
     chosen = choose_batch(ranked, fraction, rescan)
     if not chosen:
@@ -1070,13 +1188,13 @@ def sync_tracked_wallets(conn, cur, sleep=None):
         return 0
 
 
-def run_harvest(conn, mint_override, sleep=None):
+def run_harvest(conn, mint_override, sleep=None, now=None):
     cur = conn.cursor()
     fraction = top_fraction()
     rescan = rescan_enabled()
     try:
         chosen, ranked_n = select_mints(
-            cur, mint_override, fraction, rescan, sleep=sleep,
+            cur, mint_override, fraction, rescan, sleep=sleep, now=now,
         )
     except FatalLedger as exc:
         log.error("status=error reason=%s phase=fatal", exc)
@@ -1090,12 +1208,15 @@ def run_harvest(conn, mint_override, sleep=None):
     if not chosen:
         return 0
     shown_fraction = "override" if mint_override else fraction
+    shown_window = "override" if mint_override else window_hours()
     log.info(
-        "batch selected ranked=%s quintile=%s chosen=%s fraction=%s rescan=%s",
+        "batch selected ranked=%s quintile=%s chosen=%s fraction=%s "
+        "window_hours=%s rescan=%s",
         ranked_n,
         len(chosen) if mint_override else quintile_size(ranked_n, fraction),
         len(chosen),
         shown_fraction,
+        shown_window,
         str(rescan).lower(),
     )
     key = os.getenv("SOLANA_TRACKER_API_KEY", "")

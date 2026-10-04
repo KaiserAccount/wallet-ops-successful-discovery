@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import unittest
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
 
@@ -18,9 +19,15 @@ def _clear_run_flags():
         "DISCOVER_SMOKE",
         "DISCOVER_RESCAN",
         "DISCOVER_TOP_FRACTION",
+        "DISCOVER_WINDOW_HOURS",
         "MATRIX_RUN",
     ):
         os.environ.pop(name, None)
+
+
+def _ago(hours):
+    """Timezone-aware timestamp `hours` before now."""
+    return datetime.now(timezone.utc) - timedelta(hours=hours)
 
 
 class _Cursor:
@@ -261,7 +268,7 @@ class ProgressLogTest(unittest.TestCase):
         )
 
     def test_run_harvest_logs_mint_upsert_and_summary(self):
-        cursor = _Cursor([(9, "MintABC", Decimal("3.5"), None, None)])
+        cursor = _Cursor([(9, "MintABC", Decimal("3.5"), _ago(1), None)])
         conn = _Conn(cursor)
         traders = [{
             "wallet": "Wal1",
@@ -345,7 +352,7 @@ class ProgressLogTest(unittest.TestCase):
         )
 
     def test_missing_api_key_names_the_reason(self):
-        cursor = _Cursor([(9, "MintABC", Decimal("3"), None, None)])
+        cursor = _Cursor([(9, "MintABC", Decimal("3"), _ago(1), None)])
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SOLANA_TRACKER_API_KEY", None)
             with self.assertLogs("discover", level="INFO") as captured:
@@ -411,6 +418,10 @@ class QuintileAndIsolationTest(unittest.TestCase):
         self.assertIn("roi_multiple DESC", discover.RANKED_MINTS_SQL)
         self.assertIn("DISTINCT ON (o.token_address)", discover.RANKED_MINTS_SQL)
         self.assertIn("left(lower(o.chain), 3) = 'sol'", discover.RANKED_MINTS_SQL)
+        self.assertIn(
+            "o.detected_at >= now() - (%s * interval '1 hour')",
+            discover.RANKED_MINTS_SQL,
+        )
         self.assertNotIn("LIMIT", discover.RANKED_MINTS_SQL)
         self.assertIn("'tracker_traders',false,", discover.HARVEST_SQL.replace(" ", ""))
         self.assertIn("LIMIT 100", discover.PROMOTE_SQL)
@@ -447,11 +458,11 @@ class QuintileAndIsolationTest(unittest.TestCase):
     def test_one_bad_mint_does_not_abort_the_batch(self):
         # Ten ranked mints → quintile of 2. The leader's tracker call fails.
         ranked = [
-            (1, "BAD", Decimal("50"), None, None),
-            (2, "GOOD", Decimal("40"), None, None),
+            (1, "BAD", Decimal("50"), _ago(1), None),
+            (2, "GOOD", Decimal("40"), _ago(1), None),
         ]
         for index in range(3, 11):
-            ranked.append((index, f"M{index}", Decimal(str(30 - index)), None, None))
+            ranked.append((index, f"M{index}", Decimal(str(30 - index)), _ago(1), None))
         cursor = _Cursor(ranked)
         conn = _Conn(cursor)
 
@@ -472,7 +483,11 @@ class QuintileAndIsolationTest(unittest.TestCase):
         execute_values.assert_called_once()
         self.assertEqual(execute_values.call_args.args[2][0][1], "GOOD")
         blob = "\n".join(captured.output)
-        self.assertIn("batch selected ranked=10 quintile=2 chosen=2 fraction=0.2 rescan=false", blob)
+        self.assertIn(
+            "batch selected ranked=10 quintile=2 chosen=2 fraction=0.2 "
+            "window_hours=10 rescan=false",
+            blob,
+        )
         self.assertIn("mint=BAD status=error reason=RuntimeError phase=harvest", blob)
         self.assertIn("mint=GOOD pages=1 upserted=1 green_usd=25 status=ok", blob)
         self.assertIn("batch summary selected=2 ok=1 empty=0 error=1", blob)
@@ -482,11 +497,11 @@ class QuintileAndIsolationTest(unittest.TestCase):
 
     def test_postgres_error_on_one_mint_does_not_block_the_next(self):
         ranked = [
-            (1, "BAD", Decimal("50"), None, None),
-            (2, "GOOD", Decimal("40"), None, None),
+            (1, "BAD", Decimal("50"), _ago(1), None),
+            (2, "GOOD", Decimal("40"), _ago(1), None),
         ]
         for index in range(3, 11):
-            ranked.append((index, f"M{index}", Decimal("2"), None, None))
+            ranked.append((index, f"M{index}", Decimal("2"), _ago(1), None))
         cursor = _Cursor(ranked)
 
         def execute_values(_cur, _sql, rows, page_size=200):
@@ -510,11 +525,11 @@ class QuintileAndIsolationTest(unittest.TestCase):
 
     def test_fatal_ledger_stops_the_batch(self):
         ranked = [
-            (1, "BAD", Decimal("50"), None, None),
-            (2, "GOOD", Decimal("40"), None, None),
+            (1, "BAD", Decimal("50"), _ago(1), None),
+            (2, "GOOD", Decimal("40"), _ago(1), None),
         ]
         for index in range(3, 11):
-            ranked.append((index, f"M{index}", Decimal("2"), None, None))
+            ranked.append((index, f"M{index}", Decimal("2"), _ago(1), None))
 
         class _FatalCursor(_Cursor):
             def execute(self, sql, params=None):
@@ -564,8 +579,81 @@ class QuintileAndIsolationTest(unittest.TestCase):
         self.assertIn("tracker page=1 failed reason=TimeoutException", blob)
         self.assertNotIn("super-secret-key", blob)
 
+    def test_window_hours_default_and_override(self):
+        self.assertEqual(discover.window_hours(None), 10)
+        self.assertEqual(discover.window_hours(""), 10)
+        self.assertEqual(discover.window_hours("10"), 10)
+        self.assertEqual(discover.window_hours("10h"), 10)
+        self.assertEqual(discover.window_hours("2.5"), 2.5)
+        with self.assertLogs("discover", level="INFO") as captured:
+            self.assertEqual(discover.window_hours("0"), 10)
+            self.assertEqual(discover.window_hours("nope"), 10)
+        self.assertIn("DISCOVER_WINDOW_HOURS", "\n".join(captured.output))
+
+    def test_duplicate_outcomes_count_once_and_old_outcomes_drop(self):
+        now = datetime(2026, 10, 4, 22, 0, tzinfo=timezone.utc)
+        rows = [
+            (1, "DUP", Decimal("4"), now - timedelta(hours=2), None),
+            (2, "DUP", Decimal("9"), now - timedelta(hours=5), None),
+            (3, "DUP", Decimal("9"), now - timedelta(hours=1), None),
+            (4, "OLD", Decimal("100"), now - timedelta(hours=10, seconds=1), None),
+            (5, "EDGE", Decimal("3"), now - timedelta(hours=10), None),
+            (6, "NEW", Decimal("5"), now - timedelta(hours=1), "error"),
+            (7, "STALE", Decimal("8"), None, None),
+        ]
+        collapsed = discover.collapse_outcomes(rows, now, 10)
+        self.assertEqual([row[1] for row in collapsed], ["DUP", "NEW", "EDGE"])
+        # Same roi: the later detected_at wins, so DUP is outcome 3, not 2.
+        self.assertEqual(collapsed[0][0], 3)
+        self.assertEqual(collapsed[0][2], Decimal("9"))
+        self.assertNotIn("OLD", [row[1] for row in collapsed])
+        self.assertNotIn("STALE", [row[1] for row in collapsed])
+        self.assertEqual(len(collapsed), 3)
+
+    def test_run_harvest_does_not_double_count_or_include_old_mints(self):
+        # Four outcomes for HOT plus four other recent mints would be 8 rows.
+        # Collapse makes 5 distinct tokens, so the default quintile is 1.
+        # OLD's higher ROI is outside the window and must not take that slot.
+        ranked = [
+            (1, "HOT", Decimal("7"), _ago(2), None),
+            (2, "HOT", Decimal("10"), _ago(3), None),
+            (3, "HOT", Decimal("8"), _ago(1), None),
+            (4, "M6", Decimal("6"), _ago(1), None),
+            (5, "M5", Decimal("5"), _ago(1), None),
+            (6, "M4", Decimal("4"), _ago(1), None),
+            (7, "M3", Decimal("3"), _ago(1), None),
+            (99, "OLD", Decimal("1000"), _ago(11), None),
+        ]
+        fetched = []
+
+        def fetch(_client, _key, mint, sleep=None):
+            fetched.append(mint)
+            return ([{
+                "wallet": "WalHot",
+                "pnl": {"token": {"realized": "25"}},
+            }], 1)
+
+        with mock.patch.dict(os.environ, {"SOLANA_TRACKER_API_KEY": "k"}):
+            _clear_run_flags()
+            with mock.patch("discover.fetch", side_effect=fetch):
+                with mock.patch("discover.execute_values") as execute_values:
+                    with self.assertLogs("discover", level="INFO") as captured:
+                        self.assertEqual(discover.run_harvest(_Conn(_Cursor(ranked)), None), 0)
+        self.assertEqual(fetched, ["HOT"])
+        self.assertEqual(execute_values.call_args.args[2][0][1], "HOT")
+        blob = "\n".join(captured.output)
+        self.assertIn(
+            "batch selected ranked=5 quintile=1 chosen=1 fraction=0.2 "
+            "window_hours=10 rescan=false",
+            blob,
+        )
+        self.assertIn("mint selected mint=HOT outcome_id=2 roi=10", blob)
+        self.assertNotIn("mint selected mint=OLD", blob)
+        self.assertNotIn("mint selected mint=M6", blob)
+        self.assertNotIn("is_active=true", blob)
+
     def test_top_quintile_already_scanned_exits_zero(self):
-        ranked = [(index, f"M{index}", Decimal("10"), None, "ok") for index in range(1, 6)]
+        ranked = [(index, f"M{index}", Decimal("10"), _ago(1), "ok") for index in range(1, 6)]
         with self.assertLogs("discover", level="INFO") as captured:
             self.assertEqual(discover.run_harvest(_Conn(_Cursor(ranked)), None), 0)
         self.assertIn(
