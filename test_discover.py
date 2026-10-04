@@ -419,9 +419,14 @@ class QuintileAndIsolationTest(unittest.TestCase):
         self.assertIn("DISTINCT ON (o.token_address)", discover.RANKED_MINTS_SQL)
         self.assertIn("left(lower(o.chain), 3) = 'sol'", discover.RANKED_MINTS_SQL)
         self.assertIn(
-            "o.detected_at >= now() - (%s * interval '1 hour')",
+            "o.message_timestamp >= now() - (%s * interval '1 hour')",
             discover.RANKED_MINTS_SQL,
         )
+        self.assertIn(
+            "o.message_timestamp DESC NULLS LAST, o.id DESC",
+            discover.RANKED_MINTS_SQL,
+        )
+        self.assertNotIn("detected_at", discover.RANKED_MINTS_SQL)
         self.assertNotIn("LIMIT", discover.RANKED_MINTS_SQL)
         self.assertIn("'tracker_traders',false,", discover.HARVEST_SQL.replace(" ", ""))
         self.assertIn("LIMIT 100", discover.PROMOTE_SQL)
@@ -603,7 +608,7 @@ class QuintileAndIsolationTest(unittest.TestCase):
         ]
         collapsed = discover.collapse_outcomes(rows, now, 10)
         self.assertEqual([row[1] for row in collapsed], ["DUP", "NEW", "EDGE"])
-        # Same roi: the later detected_at wins, so DUP is outcome 3, not 2.
+        # Same roi: the later message_timestamp wins, so DUP is outcome 3, not 2.
         self.assertEqual(collapsed[0][0], 3)
         self.assertEqual(collapsed[0][2], Decimal("9"))
         self.assertNotIn("OLD", [row[1] for row in collapsed])

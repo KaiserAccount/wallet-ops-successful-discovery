@@ -4,7 +4,7 @@
 
 Every 8 hours, harvest the top 20% of distinct tokens whose outcomes are within the last 10 hours. Paper only: no swaps, no purchases, no live trading.
 
-1. Keep `wallet_intel.telegram_call_outcomes` rows with `detected_at` inside the last 10 hours (`DISCOVER_WINDOW_HOURS`, default `10`). Collapse to one row per token (highest `roi_multiple`, then latest `detected_at`, then highest `id`) before the cut. Take the top 20% of that distinct list (`DISCOVER_TOP_FRACTION`, default `0.20`).
+1. Keep `wallet_intel.telegram_call_outcomes` rows with `message_timestamp` inside the last 10 hours (`DISCOVER_WINDOW_HOURS`, default `10`). That column is the call time. `detected_at` is null on this book and is not used. Collapse to one row per token (highest `roi_multiple`, then latest `message_timestamp`, then highest `id`) before the cut. Take the top 20% of that distinct list (`DISCOVER_TOP_FRACTION`, default `0.20`).
 2. Skip mints already ledgered `ok` or `empty` unless `DISCOVER_RESCAN` is set. `status=error` stays eligible.
 3. For each chosen mint, call Solana Tracker traders and upsert profitable wallets into `wallet_intel.wallet_token_positions`. One mint's failure is logged and skipped.
 4. Insert or update `wallet_intel.token_trader_scans` (`ok`, `empty`, or `error`).
@@ -85,9 +85,9 @@ Connect lines include host, port, user, and hostaddr only. A skip or failure nam
 
 **Definition.** A run is the top 20% of distinct tokens whose outcomes are within the last 10 hours.
 
-Those rows are Solana successes in `wallet_intel.telegram_call_outcomes` with `detected_at >= now() - window`. A row qualifies when `chain` is null or starts with `sol` (`left(lower(chain), 3) = 'sol'`), `COALESCE(is_success, roi_multiple >= 2)` is true, `roi_multiple >= 2`, and `token_address` is not null. `detected_at` null is outside the window. The cron stays `0 */8 * * *`. Default window is 10 hours (`DISCOVER_WINDOW_HOURS`).
+Those rows are Solana successes in `wallet_intel.telegram_call_outcomes` with `message_timestamp >= now() - window`. `message_timestamp` is the call time. `detected_at` is null for every row in this book, so a window on that column selects nothing. A row qualifies when `chain` is null or starts with `sol` (`left(lower(chain), 3) = 'sol'`), `COALESCE(is_success, roi_multiple >= 2)` is true, `roi_multiple >= 2`, and `token_address` is not null. A null `message_timestamp` is outside the window. The cron stays `0 */8 * * *`. Default window is 10 hours (`DISCOVER_WINDOW_HOURS`).
 
-`telegram_call_outcomes` can store several rows for one mint. Collapse to one row per token after the time filter and before the 20% cut, so duplicates cannot inflate N or harvest the same mint twice. The kept row is the strongest outcome inside the window: `roi_multiple` descending, then `detected_at` descending, then `id` descending. An older outcome, including a higher ROI from outside the window, does not represent the token.
+`telegram_call_outcomes` can store several rows for one mint. Collapse to one row per token after the time filter and before the 20% cut, so duplicates cannot inflate N or harvest the same mint twice. The kept row is the strongest outcome inside the window: `roi_multiple` descending, then `message_timestamp` descending, then `id` descending. An older call, including a higher ROI from outside the window, does not represent the token.
 
 The batch is `ceil(N × DISCOVER_TOP_FRACTION)` of that distinct list, at least 1 when N ≥ 1. Default fraction `0.20`.
 
@@ -102,7 +102,7 @@ Completed ledger rows (`token_trader_scans.status` of `ok` or `empty`) inside th
 | Tracker `/tokens/volume` and `/tokens/trending` | About 100 tokens by volume; pool objects include liquidity | A different universe from the success book. Not stored by this job. |
 | `wallet_intel.v_repeat_winners` (`n_won`, `pnl_won`) | Wallets for the promote cap of 100 | Does not choose mints. Inserts stay `is_active=false` until this view's existing rule turns them on. |
 
-This service's selection SQL reads `id`, `token_address`, `roi_multiple`, `detected_at`, and the scan `status`. A live column listing of the book timed out from the audit environment, so no extra volume or liquidity column was confirmed on `telegram_call_outcomes`. None is referenced by the harvest.
+This service's selection SQL reads `id`, `token_address`, `roi_multiple`, `message_timestamp`, and the scan `status`. `detected_at` is not read. A live column listing of the book timed out from the audit environment, so no extra volume or liquidity column was confirmed on `telegram_call_outcomes`. None is referenced by the harvest.
 
 ## Failure isolation
 

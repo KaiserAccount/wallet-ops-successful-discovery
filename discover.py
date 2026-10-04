@@ -145,9 +145,13 @@ def _as_utc(value):
     return value.astimezone(timezone.utc)
 
 
-def outcome_in_window(detected_at, now, hours):
-    """True when detected_at is inside the last `hours` hours, inclusive."""
-    stamp = _as_utc(detected_at)
+def outcome_in_window(message_timestamp, now, hours):
+    """True when message_timestamp is inside the last `hours` hours, inclusive.
+
+    message_timestamp is the call time. detected_at is null on this book and
+    is not used.
+    """
+    stamp = _as_utc(message_timestamp)
     moment = _as_utc(now)
     if stamp is None or moment is None:
         return False
@@ -155,7 +159,7 @@ def outcome_in_window(detected_at, now, hours):
 
 
 def _rank_key(row):
-    """Best-first key: higher roi_multiple, then later detected_at, then higher id."""
+    """Best-first key: higher roi_multiple, then later message_timestamp, then higher id."""
     roi = row[2]
     if isinstance(roi, Decimal):
         roi_value = roi
@@ -170,13 +174,13 @@ def _rank_key(row):
         except Exception:
             roi_value = Decimal(0)
             roi_known = False
-    detected = _as_utc(row[3])
+    called_at = _as_utc(row[3])
     identity = row[0] if isinstance(row[0], int) else 0
     return (
         roi_known,
         roi_value,
-        detected is not None,
-        detected or datetime.min.replace(tzinfo=timezone.utc),
+        called_at is not None,
+        called_at or datetime.min.replace(tzinfo=timezone.utc),
         identity,
     )
 
@@ -184,12 +188,12 @@ def _rank_key(row):
 def collapse_outcomes(rows, now, hours):
     """One row per token inside the rolling window, strongest outcome first.
 
-    Rows are (outcome_id, token_mint, roi_multiple, detected_at, scan_status).
-    Outcomes with no detected_at, and outcomes older than `hours`, are dropped
-    before the collapse. Duplicate outcomes for one mint cannot inflate the
-    set: the kept row is the highest roi_multiple, then the latest detected_at,
-    then the highest id. The returned list is ranked the same way, before the
-    quintile cut.
+    Rows are (outcome_id, token_mint, roi_multiple, message_timestamp, scan_status).
+    Outcomes with no message_timestamp, and outcomes older than `hours`, are
+    dropped before the collapse. Duplicate outcomes for one mint cannot inflate
+    the set: the kept row is the highest roi_multiple, then the latest
+    message_timestamp, then the highest id. The returned list is ranked the
+    same way, before the quintile cut. detected_at is not a call time.
     """
     best = {}
     for row in rows:
@@ -251,7 +255,7 @@ def quintile_size(n, fraction):
 def choose_batch(ranked_rows, fraction, rescan):
     """Top fraction of a best-first ranked book, minus completed scans.
 
-    Each row is (outcome_id, token_mint, roi_multiple, detected_at, scan_status).
+    Each row is (outcome_id, token_mint, roi_multiple, message_timestamp, scan_status).
     scan_status is None when the mint has no token_trader_scans row.
     ok and empty are completed. error is not, so that mint stays eligible.
     """
@@ -842,20 +846,20 @@ def fetch(client, key, mint, sleep=None):
 # runs after the time filter, so an older higher-ROI outcome cannot represent
 # the token. Tracker realized PnL ranks traders inside a mint after this choice.
 RANKED_MINTS_SQL = (
-    "SELECT r.id, r.token_address, r.roi_multiple, r.detected_at, s.status "
+    "SELECT r.id, r.token_address, r.roi_multiple, r.message_timestamp, s.status "
     "FROM ("
     "SELECT DISTINCT ON (o.token_address) "
-    "o.id, o.token_address, o.roi_multiple, o.detected_at "
+    "o.id, o.token_address, o.roi_multiple, o.message_timestamp "
     "FROM wallet_intel.telegram_call_outcomes o "
     "WHERE (o.chain IS NULL OR left(lower(o.chain), 3) = 'sol') "
     "AND COALESCE(o.is_success, o.roi_multiple >= 2) = true "
     "AND o.roi_multiple >= 2 AND o.token_address IS NOT NULL "
-    "AND o.detected_at >= now() - (%s * interval '1 hour') "
+    "AND o.message_timestamp >= now() - (%s * interval '1 hour') "
     "ORDER BY o.token_address, o.roi_multiple DESC NULLS LAST, "
-    "o.detected_at DESC NULLS LAST, o.id DESC"
+    "o.message_timestamp DESC NULLS LAST, o.id DESC"
     ") r "
     "LEFT JOIN wallet_intel.token_trader_scans s ON s.token_mint = r.token_address "
-    "ORDER BY r.roi_multiple DESC NULLS LAST, r.detected_at DESC NULLS LAST, r.id DESC"
+    "ORDER BY r.roi_multiple DESC NULLS LAST, r.message_timestamp DESC NULLS LAST, r.id DESC"
 )
 
 POSITIONS_SQL = (
@@ -1106,10 +1110,10 @@ def select_mints(cur, mint_override, fraction, rescan, sleep=None, now=None):
 
         def _outcome():
             cur.execute(
-                "SELECT id,token_address,roi_multiple,detected_at "
+                "SELECT id,token_address,roi_multiple,message_timestamp "
                 "FROM wallet_intel.telegram_call_outcomes "
                 "WHERE token_address=%s "
-                "ORDER BY roi_multiple DESC NULLS LAST, detected_at DESC NULLS LAST, id DESC "
+                "ORDER BY roi_multiple DESC NULLS LAST, message_timestamp DESC NULLS LAST, id DESC "
                 "LIMIT 1",
                 (mint_override,),
             )
@@ -1220,7 +1224,7 @@ def run_harvest(conn, mint_override, sleep=None, now=None):
         str(rescan).lower(),
     )
     key = os.getenv("SOLANA_TRACKER_API_KEY", "")
-    for outcome_id, mint, roi, _detected, _status in chosen:
+    for outcome_id, mint, roi, _message_timestamp, _status in chosen:
         log.info("mint selected mint=%s outcome_id=%s roi=%s", mint, outcome_id, roi)
     if not key:
         log.error(
@@ -1229,7 +1233,7 @@ def run_harvest(conn, mint_override, sleep=None, now=None):
         )
         return 1
     counts = {"ok": 0, "empty": 0, "error": 0}
-    for outcome_id, mint, roi, _detected, _status in chosen:
+    for outcome_id, mint, roi, _message_timestamp, _status in chosen:
         try:
             status = harvest_one(
                 conn, cur, key, outcome_id, mint, roi, sleep=sleep,
