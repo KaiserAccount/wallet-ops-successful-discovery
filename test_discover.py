@@ -6,13 +6,20 @@ import unittest
 from decimal import Decimal
 from unittest import mock
 
+import httpx
 import psycopg2
 
 import discover
 
 
 def _clear_run_flags():
-    for name in ("DISCOVER_TEST", "DISCOVER_SMOKE", "MATRIX_RUN"):
+    for name in (
+        "DISCOVER_TEST",
+        "DISCOVER_SMOKE",
+        "DISCOVER_RESCAN",
+        "DISCOVER_TOP_FRACTION",
+        "MATRIX_RUN",
+    ):
         os.environ.pop(name, None)
 
 
@@ -37,17 +44,27 @@ class _Cursor:
             return None
         return self._fetched.pop(0)
 
+    def fetchall(self):
+        rows = list(self._fetched)
+        self._fetched.clear()
+        return rows
+
 
 class _Conn:
     def __init__(self, cursor):
         self.cursor_obj = cursor
         self.commits = 0
+        self.rollbacks = 0
+        self.closed = 0
 
     def cursor(self):
         return self.cursor_obj
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 class _Resp:
@@ -244,7 +261,7 @@ class ProgressLogTest(unittest.TestCase):
         )
 
     def test_run_harvest_logs_mint_upsert_and_summary(self):
-        cursor = _Cursor([(9, "MintABC", Decimal("3.5"), None)])
+        cursor = _Cursor([(9, "MintABC", Decimal("3.5"), None, None)])
         conn = _Conn(cursor)
         traders = [{
             "wallet": "Wal1",
@@ -272,7 +289,7 @@ class ProgressLogTest(unittest.TestCase):
         self.assertNotIn("super-secret-key", blob)
 
     def test_already_scanned_skip_names_the_reason(self):
-        cursor = _Cursor([(1,)])
+        cursor = _Cursor([("ok",)])
         with self.assertLogs("discover", level="INFO") as captured:
             self.assertEqual(discover.run_harvest(_Conn(cursor), "MintABC"), 0)
         self.assertEqual(len(cursor.calls), 1)
@@ -281,16 +298,54 @@ class ProgressLogTest(unittest.TestCase):
             "\n".join(captured.output),
         )
 
+    def test_error_scan_is_not_treated_as_already_scanned(self):
+        cursor = _Cursor([
+            ("error",),
+            (9, "MintABC", Decimal("3"), None),
+        ])
+        traders = [{
+            "wallet": "Wal1",
+            "pnl": {"token": {"realized": "25"}},
+        }]
+        with mock.patch.dict(os.environ, {"SOLANA_TRACKER_API_KEY": "k"}, clear=False):
+            os.environ.pop("DISCOVER_RESCAN", None)
+            with mock.patch("discover.fetch", return_value=(traders, 1)):
+                with mock.patch("discover.execute_values"):
+                    with self.assertLogs("discover", level="INFO") as captured:
+                        self.assertEqual(discover.run_harvest(_Conn(cursor), "MintABC"), 0)
+        blob = "\n".join(captured.output)
+        self.assertIn("mint selected mint=MintABC", blob)
+        self.assertNotIn("already_scanned", blob)
+
+    def test_rescan_includes_ok_mint(self):
+        cursor = _Cursor([
+            ("ok",),
+            (9, "MintABC", Decimal("3"), None),
+        ])
+        traders = [{
+            "wallet": "Wal1",
+            "pnl": {"token": {"realized": "25"}},
+        }]
+        with mock.patch.dict(os.environ, {
+            "SOLANA_TRACKER_API_KEY": "k",
+            "DISCOVER_RESCAN": "1",
+        }):
+            with mock.patch("discover.fetch", return_value=(traders, 1)) as fetch:
+                with mock.patch("discover.execute_values"):
+                    with self.assertLogs("discover", level="INFO"):
+                        self.assertEqual(discover.run_harvest(_Conn(cursor), "MintABC"), 0)
+        fetch.assert_called_once()
+
     def test_no_unscanned_mint_names_the_reason(self):
         with self.assertLogs("discover", level="INFO") as captured:
-            self.assertEqual(discover.run_harvest(_Conn(_Cursor([None])), None), 0)
+            self.assertEqual(discover.run_harvest(_Conn(_Cursor([])), None), 0)
         self.assertIn(
             "no unscanned mint; exit 0 reason=no_unscanned_mint",
             "\n".join(captured.output),
         )
 
     def test_missing_api_key_names_the_reason(self):
-        cursor = _Cursor([(9, "MintABC", Decimal("3"), None)])
+        cursor = _Cursor([(9, "MintABC", Decimal("3"), None, None)])
         with mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("SOLANA_TRACKER_API_KEY", None)
             with self.assertLogs("discover", level="INFO") as captured:
@@ -298,6 +353,225 @@ class ProgressLogTest(unittest.TestCase):
         blob = "\n".join(captured.output)
         self.assertIn("mint selected mint=MintABC outcome_id=9 roi=3", blob)
         self.assertIn("reason=SOLANA_TRACKER_API_KEY_unset", blob)
+
+
+class _BoomTrader(dict):
+    def get(self, key, default=None):
+        if key == "wallet":
+            raise RuntimeError("bad payload")
+        return super().get(key, default)
+
+
+class QuintileAndIsolationTest(unittest.TestCase):
+    def test_quintile_size_is_ceil_of_the_fraction(self):
+        self.assertEqual(discover.quintile_size(0, 0.20), 0)
+        self.assertEqual(discover.quintile_size(1, 0.20), 1)
+        self.assertEqual(discover.quintile_size(4, 0.20), 1)
+        self.assertEqual(discover.quintile_size(5, 0.20), 1)
+        self.assertEqual(discover.quintile_size(6, 0.20), 2)
+        self.assertEqual(discover.quintile_size(10, 0.20), 2)
+        self.assertEqual(discover.quintile_size(11, 0.20), 3)
+        self.assertEqual(discover.quintile_size(10, 1), 10)
+
+    def test_top_fraction_accepts_percent_and_rejects_garbage(self):
+        self.assertEqual(discover.top_fraction("0.20"), 0.20)
+        self.assertEqual(discover.top_fraction("20%"), 0.20)
+        self.assertEqual(discover.top_fraction("20"), 0.20)
+        self.assertEqual(discover.top_fraction("1"), 1.0)
+        with self.assertLogs("discover", level="INFO") as captured:
+            self.assertEqual(discover.top_fraction("nope"), 0.20)
+            self.assertEqual(discover.top_fraction("0"), 0.20)
+        self.assertIn("DISCOVER_TOP_FRACTION", "\n".join(captured.output))
+
+    def test_choose_batch_is_the_leading_quintile_skipping_completed_scans(self):
+        ranked = [
+            (1, "A", Decimal("10"), None, "ok"),
+            (2, "B", Decimal("9"), None, "empty"),
+            (3, "C", Decimal("8"), None, "error"),
+            (4, "D", Decimal("7"), None, None),
+            (5, "E", Decimal("6"), None, None),
+        ]
+        # 20% of 5 is the single best mint, and that mint is already ok.
+        self.assertEqual(discover.choose_batch(ranked, 0.20, False), [])
+        self.assertEqual(
+            [row[1] for row in discover.choose_batch(ranked, 0.20, True)],
+            ["A"],
+        )
+        # 60% covers A, B, and C. Completed ok/empty drop out. error stays.
+        self.assertEqual(
+            [row[1] for row in discover.choose_batch(ranked, 0.60, False)],
+            ["C"],
+        )
+        self.assertEqual(
+            [row[1] for row in discover.choose_batch(ranked, 1, False)],
+            ["C", "D", "E"],
+        )
+
+    def test_ranked_sql_uses_roi_and_not_limit_one(self):
+        self.assertIn("roi_multiple DESC", discover.RANKED_MINTS_SQL)
+        self.assertIn("DISTINCT ON (o.token_address)", discover.RANKED_MINTS_SQL)
+        self.assertIn("left(lower(o.chain), 3) = 'sol'", discover.RANKED_MINTS_SQL)
+        self.assertNotIn("LIMIT", discover.RANKED_MINTS_SQL)
+        self.assertIn("'tracker_traders',false,", discover.HARVEST_SQL.replace(" ", ""))
+        self.assertIn("LIMIT 100", discover.PROMOTE_SQL)
+
+    def test_bad_wallet_is_skipped_and_the_good_wallet_remains(self):
+        traders = [
+            {"wallet": "GOOD", "pnl": {"token": {"realized": "10"}}},
+            _BoomTrader(pnl={"token": {"realized": "12"}}),
+        ]
+        with self.assertLogs("discover", level="INFO") as captured:
+            rows, failures = discover.rows_from_traders(traders, "MintABC")
+        self.assertEqual(failures, 1)
+        self.assertEqual([row[0] for row in rows], ["GOOD"])
+        blob = "\n".join(captured.output)
+        self.assertIn("mint=MintABC wallet=- status=error reason=RuntimeError phase=payload", blob)
+        self.assertNotIn("bad payload", blob)
+
+    def test_fetch_keeps_the_page_when_one_trader_payload_raises(self):
+        client = _Client([{
+            "traders": [
+                {"wallet": "GOOD", "pnl": {"token": {"realized": "80"}}},
+                _BoomTrader(pnl={"token": {"realized": "90"}}),
+            ],
+            "pagination": {"hasMore": False},
+        }])
+        with self.assertLogs("discover", level="INFO") as captured:
+            traders, pages = discover.fetch(client, "super-secret-key", "MintABC")
+        self.assertEqual(pages, 1)
+        self.assertEqual([t["wallet"] for t in traders], ["GOOD"])
+        blob = "\n".join(captured.output)
+        self.assertIn("mint=MintABC wallet=- status=error reason=RuntimeError phase=payload", blob)
+        self.assertNotIn("super-secret-key", blob)
+
+    def test_one_bad_mint_does_not_abort_the_batch(self):
+        # Ten ranked mints → quintile of 2. The leader's tracker call fails.
+        ranked = [
+            (1, "BAD", Decimal("50"), None, None),
+            (2, "GOOD", Decimal("40"), None, None),
+        ]
+        for index in range(3, 11):
+            ranked.append((index, f"M{index}", Decimal(str(30 - index)), None, None))
+        cursor = _Cursor(ranked)
+        conn = _Conn(cursor)
+
+        def fetch(_client, _key, mint, sleep=None):
+            if mint == "BAD":
+                raise RuntimeError("tracker down")
+            return ([{
+                "wallet": "WalGood",
+                "pnl": {"token": {"realized": "25"}},
+            }], 1)
+
+        with mock.patch.dict(os.environ, {"SOLANA_TRACKER_API_KEY": "super-secret-key"}):
+            _clear_run_flags()
+            with mock.patch("discover.fetch", side_effect=fetch):
+                with mock.patch("discover.execute_values") as execute_values:
+                    with self.assertLogs("discover", level="INFO") as captured:
+                        self.assertEqual(discover.run_harvest(conn, None), 0)
+        execute_values.assert_called_once()
+        self.assertEqual(execute_values.call_args.args[2][0][1], "GOOD")
+        blob = "\n".join(captured.output)
+        self.assertIn("batch selected ranked=10 quintile=2 chosen=2 fraction=0.2 rescan=false", blob)
+        self.assertIn("mint=BAD status=error reason=RuntimeError phase=harvest", blob)
+        self.assertIn("mint=GOOD pages=1 upserted=1 green_usd=25 status=ok", blob)
+        self.assertIn("batch summary selected=2 ok=1 empty=0 error=1", blob)
+        self.assertNotIn("mint selected mint=M3", blob)
+        self.assertNotIn("super-secret-key", blob)
+        self.assertGreaterEqual(conn.rollbacks, 1)
+
+    def test_postgres_error_on_one_mint_does_not_block_the_next(self):
+        ranked = [
+            (1, "BAD", Decimal("50"), None, None),
+            (2, "GOOD", Decimal("40"), None, None),
+        ]
+        for index in range(3, 11):
+            ranked.append((index, f"M{index}", Decimal("2"), None, None))
+        cursor = _Cursor(ranked)
+
+        def execute_values(_cur, _sql, rows, page_size=200):
+            if rows and rows[0][1] == "BAD":
+                raise psycopg2.DataError("bad numeric")
+
+        traders = [{"wallet": "Wal1", "pnl": {"token": {"realized": "25"}}}]
+        with mock.patch.dict(os.environ, {"SOLANA_TRACKER_API_KEY": "k"}):
+            _clear_run_flags()
+            with mock.patch("discover.fetch", return_value=(traders, 1)):
+                with mock.patch("discover.execute_values", side_effect=execute_values):
+                    with self.assertLogs("discover", level="INFO") as captured:
+                        self.assertEqual(
+                            discover.run_harvest(_Conn(cursor), None, sleep=lambda _s: None),
+                            0,
+                        )
+        blob = "\n".join(captured.output)
+        self.assertIn("mint=BAD wallet=Wal1 status=error reason=DataError phase=upsert", blob)
+        self.assertIn("mint=GOOD pages=1 upserted=1 green_usd=25 status=ok", blob)
+        self.assertIn("batch summary selected=2 ok=1 empty=0 error=1", blob)
+
+    def test_fatal_ledger_stops_the_batch(self):
+        ranked = [
+            (1, "BAD", Decimal("50"), None, None),
+            (2, "GOOD", Decimal("40"), None, None),
+        ]
+        for index in range(3, 11):
+            ranked.append((index, f"M{index}", Decimal("2"), None, None))
+
+        class _FatalCursor(_Cursor):
+            def execute(self, sql, params=None):
+                super().execute(sql, params)
+                if sql.startswith("INSERT INTO wallet_intel.token_trader_scans"):
+                    raise psycopg2.errors.UndefinedTable(
+                        'relation "wallet_intel.token_trader_scans" does not exist'
+                    )
+
+        fetched = []
+
+        def fetch(_client, _key, mint, sleep=None):
+            fetched.append(mint)
+            raise RuntimeError("tracker down")
+
+        cursor = _FatalCursor(ranked)
+        with mock.patch.dict(os.environ, {"SOLANA_TRACKER_API_KEY": "k"}):
+            _clear_run_flags()
+            with mock.patch("discover.fetch", side_effect=fetch):
+                with self.assertLogs("discover", level="INFO") as captured:
+                    self.assertEqual(discover.run_harvest(_Conn(cursor), None), 1)
+        self.assertEqual(fetched, ["BAD"])
+        blob = "\n".join(captured.output)
+        self.assertIn("mint=BAD status=error reason=UndefinedTable phase=fatal", blob)
+        self.assertNotIn("mint=GOOD pages=", blob)
+        self.assertNotIn("status=ok", blob)
+
+    def test_timeout_is_retried_then_skipped(self):
+        calls = {"n": 0}
+
+        class _TimeoutClient:
+            def get(self, url, params=None, headers=None, timeout=None):
+                calls["n"] += 1
+                raise httpx.TimeoutException("timed out")
+
+        sleeps = []
+        with self.assertLogs("discover", level="INFO") as captured:
+            with self.assertRaises(httpx.TimeoutException):
+                discover.fetch(
+                    _TimeoutClient(), "super-secret-key", "MintABC",
+                    sleep=sleeps.append,
+                )
+        self.assertEqual(calls["n"], 2)
+        self.assertEqual(sleeps, [discover.RETRY_BASE_SEC])
+        blob = "\n".join(captured.output)
+        self.assertIn("retry tracker mint=MintABC page=1 attempt=1 reason=TimeoutException", blob)
+        self.assertIn("tracker page=1 failed reason=TimeoutException", blob)
+        self.assertNotIn("super-secret-key", blob)
+
+    def test_top_quintile_already_scanned_exits_zero(self):
+        ranked = [(index, f"M{index}", Decimal("10"), None, "ok") for index in range(1, 6)]
+        with self.assertLogs("discover", level="INFO") as captured:
+            self.assertEqual(discover.run_harvest(_Conn(_Cursor(ranked)), None), 0)
+        self.assertIn(
+            "reason=top_quintile_already_scanned",
+            "\n".join(captured.output),
+        )
 
 
 class ConnectShapeTest(unittest.TestCase):

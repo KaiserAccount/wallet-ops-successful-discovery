@@ -2,12 +2,13 @@
 
 **What this service does**
 
-One Solana mint every 8 hours. Paper only: no swaps, no purchases, no live trading.
+The top ROI quintile of Solana success mints, every 8 hours. Paper only: no swaps, no purchases, no live trading.
 
-1. Pick the highest-ROI unscanned Solana row in `wallet_intel.telegram_call_outcomes`.
-2. Call Solana Tracker traders and upsert profitable wallets into `wallet_intel.wallet_token_positions`.
-3. Insert `wallet_intel.token_trader_scans` so that mint is never pulled again.
-4. Harvest repeat winners into `public.tracked_wallets` inactive, then promote at most 100 tracker wallets.
+1. Rank distinct success mints in `wallet_intel.telegram_call_outcomes` by `roi_multiple` and take the top 20% (`DISCOVER_TOP_FRACTION`, default `0.20`).
+2. Skip mints already ledgered `ok` or `empty` unless `DISCOVER_RESCAN` is set. `status=error` stays eligible.
+3. For each chosen mint, call Solana Tracker traders and upsert profitable wallets into `wallet_intel.wallet_token_positions`. One mint's failure is logged and skipped.
+4. Insert or update `wallet_intel.token_trader_scans` (`ok`, `empty`, or `error`).
+5. Harvest repeat winners into `public.tracked_wallets` inactive (`is_active=false`), then promote at most 100 tracker wallets under the existing `v_repeat_winners` rule. A larger mint batch does not activate wallets.
 
 Each cron start runs that list once and exits. `DISCOVER_TEST` only labels a one-shot check; it does not gate the harvest. See the sequence below.
 
@@ -24,7 +25,9 @@ A cron service does **not** start on deploy or when a variable changes. Railway 
 - `SOLANA_TRACKER_API_KEY`
 - `SUPABASE_HOST`, `SUPABASE_PORT`, `SUPABASE_USER`, `SUPABASE_PASSWORD`, `SUPABASE_DBNAME`, or `DATABASE_URL`
 - `DISCOVER_TEST` — optional one-shot label (`1` / `true` / `yes`). Unset is the normal cron harvest. `DISCOVER_SMOKE` is a deprecated alias of `DISCOVER_TEST` and does not gate cron.
-- `PYTHONUNBUFFERED=1` — already set in the image. Logs are INFO on stdout (not stderr) and flushed per line. Do not rely on stderr, which Railway tags as errors.
+- `DISCOVER_TOP_FRACTION` — optional. Default `0.20` (top quintile). `1` is the whole ranked set. `20` and `20%` are the same as `0.20`.
+- `DISCOVER_RESCAN` — optional (`1` / `true` / `yes`). Unset skips mints ledgered `ok` or `empty`.
+- `PYTHONUNBUFFERED=1` — already set in the image. Logs are INFO and ERROR on stdout (not stderr) and flushed per line. Do not rely on stderr, which Railway tags as errors.
 
 Apply `migrations/20260930_token_trader_harvest.sql` before the first real cron run.
 
@@ -52,34 +55,70 @@ A failed connect raises a message that names the host, port, user, and hostaddrs
 
 | Value | Behavior |
 | --- | --- |
-| unset, empty, `0`, `false`, `no` | Cron mode. Log `run start mode=cron paper=true` and run one paper harvest, then exit. |
-| `1`, `true`, `yes` | One-shot test. Log `run start mode=test paper=true via=DISCOVER_TEST` and `ONE-SHOT TEST`, run one paper harvest, then exit. |
+| unset, empty, `0`, `false`, `no` | Cron mode. Log `run start mode=cron paper=true` and run one paper harvest of the top ROI quintile, then exit. |
+| `1`, `true`, `yes` | One-shot test. Log `run start mode=test paper=true via=DISCOVER_TEST` and `ONE-SHOT TEST`, run one paper harvest of the top ROI quintile, then exit. |
 
 `DISCOVER_SMOKE` is a deprecated alias with the same truthy set. If it is still `1` from the old arming switch, the run is labeled test (`via=DISCOVER_SMOKE (deprecated alias of DISCOVER_TEST)`) and still harvests. Unset it when you want cron lines to say `mode=cron`. Leaving both unset is the production cron setup.
 
 Progress lines (stdout, INFO, flushed) look like:
 
 ```
-run start mode=test paper=true via=DISCOVER_TEST; ONE-SHOT TEST paper harvest, running once then exit
+run start mode=test paper=true via=DISCOVER_TEST; ONE-SHOT TEST paper harvest of the top ROI quintile, running once then exit
 connect attempt host=aws-0-us-west-2.pooler.supabase.com port=5432 user=postgres.<ref> hostaddr=54.70.143.232
 connected host=aws-0-us-west-2.pooler.supabase.com port=5432 user=postgres.<ref> hostaddr=54.70.143.232
+batch selected ranked=40 quintile=8 chosen=8 fraction=0.2 rescan=false
 mint selected mint=<mint> outcome_id=123 roi=4.2
 tracker page=1 kept=12 cumulative=12 hasMore=True
 tracker stop page=2 reason=below_realized_floor
 upsert progress rows=20 green_usd=1500
+mint=<mint> pages=2 upserted=20 green_usd=1500 status=ok
+mint=<mint> status=error reason=TimeoutException phase=harvest
+batch summary selected=8 ok=7 empty=0 error=1
 harvest summary rows=3 source=tracker_traders
 promote summary cap=100 rows_updated=100 source=tracker_traders
-mint=<mint> pages=2 upserted=20 green_usd=1500 status=ok
 ```
 
-Connect lines include host, port, user, and hostaddr only. A skip or failure names `reason=` (`already_scanned`, `no_unscanned_mint`, `SOLANA_TRACKER_API_KEY_unset`, `connect failed reason=...`). Tracker failures log the exception type, not the message, so the API key cannot be echoed.
+Connect lines include host, port, user, and hostaddr only. A skip or failure names `reason=` (`already_scanned`, `no_unscanned_mint`, `top_quintile_already_scanned`, `SOLANA_TRACKER_API_KEY_unset`, `connect failed reason=...`). Tracker and mint failures log the exception type, not the message, so the API key cannot be echoed. ERROR lines use the same stdout handler as the INFO progress lines.
+
+## Top 20%
+
+**Definition.** Distinct Solana success mints in `wallet_intel.telegram_call_outcomes`, ranked by `roi_multiple` descending, then `detected_at` descending, then `id` descending. A mint qualifies when `chain` is null or starts with `sol` (`left(lower(chain), 3) = 'sol'`), `COALESCE(is_success, roi_multiple >= 2)` is true, `roi_multiple >= 2`, and `token_address` is not null. One row per mint: the highest-ROI outcome. The batch is `ceil(N × DISCOVER_TOP_FRACTION)` of that ranked list, at least 1 when N ≥ 1. Default fraction `0.20`.
+
+Completed ledger rows (`token_trader_scans.status` of `ok` or `empty`) inside that window are skipped unless `DISCOVER_RESCAN` is set. `error` stays in the window so a failed mint can be retried next cron without a rescan flag. If the whole window is already `ok` or `empty`, the process logs `reason=top_quintile_already_scanned` and exits 0. Mints below the quintile are not harvested on that run.
+
+**Why this ranking.** It is the order the job already used (`ORDER BY roi_multiple DESC LIMIT 1`). Checked and not used as the mint rank:
+
+| Source | What it ranks | Why it is not the quintile |
+| --- | --- | --- |
+| `telegram_call_outcomes.roi_multiple` | Success-book mints | This is the quintile. |
+| Solana Tracker traders (`sort=realized`) | Wallets inside one mint, by realized PnL, with a $50 floor | Applied after the mint is chosen. |
+| Tracker `/tokens/volume` and `/tokens/trending` | About 100 tokens by volume; pool objects include liquidity | A different universe from the success book. Not stored by this job. |
+| `wallet_intel.v_repeat_winners` (`n_won`, `pnl_won`) | Wallets for the promote cap of 100 | Does not choose mints. Inserts stay `is_active=false` until this view's existing rule turns them on. |
+
+This service's selection SQL reads `id`, `token_address`, `roi_multiple`, `detected_at`, and the scan `status`. A live column listing of the book timed out from the audit environment, so no extra volume or liquidity column was confirmed on `telegram_call_outcomes`. None is referenced by the harvest.
+
+## Failure isolation
+
+What the audit found, and what a run does now:
+
+| Failure | Before | Now |
+| --- | --- | --- |
+| Tracker HTTP error, timeout, or bad JSON on one mint | Logged, then re-raised. `main` exited 1. There was only one mint, so the run died before promote. | Retried once when the error is a timeout, transport error, or HTTP 408/429/5xx. Then ERROR `mint=… reason=<type> phase=harvest`, ledger `status=error` if the write works, next mint continues. Exit 0. |
+| Bad trader payload on a page | A raise inside the page aborted the mint and the process. JSON parsing sat outside the HTTP try. | That wallet is logged (`mint` and `wallet`) and skipped. The rest of the page is kept. A non-object body fails the mint only. |
+| Postgres data error on `wallet_token_positions` | Aborted the transaction and the process. No rollback, so the session was unusable. | Batch insert is retried once for a connection blip. A data error rolls back and retries per wallet under a savepoint. Poison rows are logged and skipped. A statement timeout is not fanned out per wallet and is not retried. |
+| `token_trader_scans` insert | `ON CONFLICT DO NOTHING`, and `status=error` was never written. A crash left no ledger row. | Upsert updates the scan. `error` is written when the mint fails and the table is writable. A later success replaces `error`. |
+| Missing table, privilege error, or dead connection while writing the ledger | Exit 1, often as an unhandled exception. | Still exit 1 (`phase=fatal`). Later mints are not attempted. |
+| Connect failure, or `SOLANA_TRACKER_API_KEY` unset | Exit 1. | Still exit 1. The key failure happens before any Tracker call. |
+| Promote / `tracked_wallets` write after a partial batch | Never reached if the single mint raised. | Runs after the batch. Inserts still use `is_active=false`. Promote still caps at 100 `v_repeat_winners`. A promote failure is logged; it exits 1 only when the ledger class of error or a dead connection is what failed. |
+
+Passwords, API keys, and full DSNs are not logged. Tracker failures log the exception type only.
 
 ### One-shot test, then cron
 
 Service: **Successful Wallet Discovery** (Wallet Ops Core). Settings → Variables, and Settings → Cron Schedule. Restart policy stays **NEVER**.
 
-1. **One-shot now.** Set `DISCOVER_TEST=1`. Redeploy. A cron service does not boot on deploy while a schedule is set, so clear Cron Schedule (empty) before that redeploy if you need the run immediately rather than at the next `0 */8 * * *` tick. Confirm logs show `mode=test`, `ONE-SHOT TEST`, then either `mint=... status=...` or `no unscanned mint`. The process exits. This is one mint, paper only.
-2. **Unattended harvests.** Unset `DISCOVER_TEST` (and unset `DISCOVER_SMOKE` if it is still present). Set Cron Schedule back to `0 */8 * * *`. Each scheduled start runs one paper mint and logs `mode=cron`. No smoke flag is required.
+1. **One-shot now.** Set `DISCOVER_TEST=1`. Redeploy. A cron service does not boot on deploy while a schedule is set, so clear Cron Schedule (empty) before that redeploy if you need the run immediately rather than at the next `0 */8 * * *` tick. Confirm logs show `mode=test`, `ONE-SHOT TEST`, then either `batch summary` or `no unscanned mint`. The process exits. This is the top ROI quintile, paper only.
+2. **Unattended harvests.** Unset `DISCOVER_TEST` (and unset `DISCOVER_SMOKE` if it is still present). Set Cron Schedule back to `0 */8 * * *`. Each scheduled start runs one paper quintile and logs `mode=cron`. No smoke flag is required. Leave `DISCOVER_RESCAN` unset unless a completed mint must be fetched again.
 
 `MATRIX_RUN=1` still runs the connect matrix only, even when `DISCOVER_TEST` is set.
 
@@ -128,7 +167,7 @@ Service: **Successful Wallet Discovery**. Start command stays `python discover.p
 3. Clear Cron Schedule (empty) and save so this starts immediately. An 8-hour cron must not be left on while `MATRIX_RUN=1`, or every tick will dial the pooler again.
 4. Read the log. A pass is one `WINNER` line and exit 0. No pass is `NO_WINNER` and exit 1. Empty password is exit 2 and does not dial. `MATRIX_ENUMERATE=1` prints the case list and does not dial, if the circuit breaker is still hot and you only want the plan.
 5. Copy `CONNECT_MODE`, `SUPABASE_HOST`, `SUPABASE_PORT`, and `SUPABASE_USER` from the `WINNER` line into the service variables. Leave the password where it is.
-6. Unset `MATRIX_RUN` (and `MATRIX_ENUMERATE`). Then follow the `DISCOVER_TEST` sequence above for one paper mint, and only then put cron back to `0 */8 * * *` with `DISCOVER_TEST` unset.
+6. Unset `MATRIX_RUN` (and `MATRIX_ENUMERATE`). Then follow the `DISCOVER_TEST` sequence above for one paper quintile, and only then put cron back to `0 */8 * * *` with `DISCOVER_TEST` unset.
 
 Preferred shape when session mode is the winner (no secret in this file):
 

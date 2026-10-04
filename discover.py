@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""Paper-only Solana Tracker trader harvest: one mint per cron run."""
+"""Paper-only Solana Tracker trader harvest: top ROI quintile per cron run.
+
+One mint's tracker, payload, or database failure is logged and skipped.
+The process exits 0 after a partial batch. Connect failure and a ledger
+that cannot be written at all still exit 1.
+"""
 from __future__ import annotations
 
 import argparse
 import logging
+import math
 import os
 import re
 import socket
 import sys
+import time
 from decimal import Decimal
 from pathlib import Path
 from urllib.parse import quote, unquote, urlparse
@@ -34,6 +41,14 @@ TRACKER_BASE = "https://data.solanatracker.io"
 PAGE_LIMIT, MAX_PAGES = 20, 23
 REALIZED_FLOOR_USD = Decimal("50")
 PROMOTE_CAP = 100
+# Leading quintile of the success book. DISCOVER_TOP_FRACTION overrides this.
+DEFAULT_TOP_FRACTION = 0.20
+# One retry after the first attempt. Enough for a blip, not a hung mint.
+RETRY_ATTEMPTS = 2
+RETRY_BASE_SEC = 0.5
+# Finished scans. status='error' stays eligible so a poison mint can be
+# retried next run without blocking the rest of this batch.
+COMPLETED_SCAN_STATUSES = ("ok", "empty")
 SESSION_MODE_PORT = 5432
 TRANSACTION_MODE_PORT = 6543
 STATEMENT_TIMEOUT_MS = 120000
@@ -77,6 +92,173 @@ def run_mode():
     return "test" if test_enabled() else "cron"
 
 
+def rescan_enabled(value=None):
+    """True when ledgered ok/empty mints should be harvested again.
+
+    DISCOVER_RESCAN uses the same truthy set as DISCOVER_TEST. Unset is
+    the cron default: skip mints already ledgered as ok or empty.
+    """
+    if value is None:
+        value = os.getenv("DISCOVER_RESCAN")
+    return flag_truthy(value)
+
+
+def top_fraction(value=None):
+    """Fraction of the ranked success book to harvest. Default 0.20.
+
+    Accepts 0.20, 20%, or 20 (numbers greater than 1 are percents).
+    1 means the whole ranked set. Invalid values log a warning and use 0.20.
+    """
+    if value is None:
+        value = os.getenv("DISCOVER_TOP_FRACTION")
+    if value is None or str(value).strip() == "":
+        return DEFAULT_TOP_FRACTION
+    raw = str(value).strip()
+    try:
+        if raw.endswith("%"):
+            number = float(raw[:-1]) / 100.0
+        else:
+            number = float(raw)
+            if number > 1:
+                number = number / 100.0
+    except ValueError:
+        log.warning(
+            "DISCOVER_TOP_FRACTION invalid value; using %s",
+            DEFAULT_TOP_FRACTION,
+        )
+        return DEFAULT_TOP_FRACTION
+    if not math.isfinite(number) or number <= 0 or number > 1:
+        log.warning(
+            "DISCOVER_TOP_FRACTION out of range; using %s",
+            DEFAULT_TOP_FRACTION,
+        )
+        return DEFAULT_TOP_FRACTION
+    return number
+
+
+def quintile_size(n, fraction):
+    """How many leading rows a fraction covers. 0 when n is 0, else at least 1."""
+    if n <= 0:
+        return 0
+    bps = int(round(float(fraction) * 10000))
+    size = (n * bps + 9999) // 10000
+    return max(1, min(n, size))
+
+
+def choose_batch(ranked_rows, fraction, rescan):
+    """Top fraction of a best-first ranked book, minus completed scans.
+
+    Each row is (outcome_id, token_mint, roi_multiple, detected_at, scan_status).
+    scan_status is None when the mint has no token_trader_scans row.
+    ok and empty are completed. error is not, so that mint stays eligible.
+    """
+    size = quintile_size(len(ranked_rows), fraction)
+    window = list(ranked_rows[:size])
+    if rescan:
+        return window
+    chosen = []
+    for row in window:
+        status = row[-1]
+        if status in COMPLETED_SCAN_STATUSES:
+            continue
+        chosen.append(row)
+    return chosen
+
+
+class FatalLedger(RuntimeError):
+    """The scan ledger cannot be written, or the connection is dead."""
+
+
+def is_fatal_ledger(exc):
+    """Schema or privilege failures mean no later mint can record a scan."""
+    return isinstance(exc, (
+        psycopg2.errors.InsufficientPrivilege,
+        psycopg2.errors.UndefinedTable,
+        psycopg2.errors.UndefinedColumn,
+        psycopg2.errors.InvalidSchemaName,
+    ))
+
+
+def connection_unusable(conn, exc):
+    """True when later mints cannot write. A dropped session is fatal."""
+    if getattr(conn, "closed", 0):
+        return True
+    if isinstance(exc, psycopg2.InterfaceError):
+        return True
+    msg = str(exc).lower()
+    return any(marker in msg for marker in (
+        "connection already closed",
+        "ssl connection has been closed",
+        "server closed the connection",
+        "could not connect to server",
+        "connection timed out",
+        "consuming input failed",
+        "connection reset",
+    ))
+
+
+def is_transient(exc):
+    """Network and database blips. Password failures and poison payloads are not."""
+    if isinstance(exc, (TimeoutError, socket.timeout, ConnectionError)):
+        return True
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.TransportError):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = getattr(exc, "response", None)
+        code = getattr(response, "status_code", 0) or 0
+        return code in {408, 429, 500, 502, 503, 504}
+    if isinstance(exc, psycopg2.errors.QueryCanceled):
+        # statement_timeout already waited. Another try would block the batch.
+        return False
+    if isinstance(exc, psycopg2.OperationalError):
+        msg = str(exc).lower()
+        if "password authentication failed" in msg or "invalid secret" in msg:
+            return False
+        return True
+    return False
+
+
+def retry_call(fn, attempts=RETRY_ATTEMPTS, sleep=None, label="op"):
+    """Run fn, retrying transient failures with linear backoff. No secrets in logs."""
+    if sleep is None:
+        sleep = time.sleep
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last = exc
+            if attempt >= attempts or not is_transient(exc):
+                raise
+            delay = RETRY_BASE_SEC * attempt
+            log.info(
+                "retry %s attempt=%s reason=%s",
+                label, attempt, type(exc).__name__,
+            )
+            sleep(delay)
+    raise last
+
+
+def rollback_quietly(conn):
+    try:
+        conn.rollback()
+    except Exception as exc:
+        log.error("rollback failed reason=%s", type(exc).__name__)
+
+
+def _wallet_label(trader):
+    try:
+        if isinstance(trader, dict):
+            raw = trader.get("wallet")
+            text = str(raw).strip() if raw else ""
+            return text or "-"
+    except Exception:
+        return "-"
+    return "-"
+
+
 def log_run_start():
     """Loud start line: cron vs test, always paper, never a secret."""
     mode = run_mode()
@@ -87,13 +269,14 @@ def log_run_start():
             via = "DISCOVER_SMOKE (deprecated alias of DISCOVER_TEST)"
         log.info(
             "run start mode=test paper=true via=%s; "
-            "ONE-SHOT TEST paper harvest, running once then exit",
+            "ONE-SHOT TEST paper harvest of the top ROI quintile, "
+            "running once then exit",
             via,
         )
     else:
         log.info(
             "run start mode=cron paper=true; "
-            "scheduled paper harvest once then exit "
+            "scheduled paper harvest of the top ROI quintile, once then exit "
             "(DISCOVER_TEST unset; DISCOVER_SMOKE is not required)"
         )
     return mode
@@ -449,7 +632,38 @@ def pagination_stop_reason(pagination, cursor, floor):
     return None
 
 
-def fetch(client, key, mint):
+def _page_floor(traders):
+    realized = []
+    for trader in traders:
+        try:
+            value = dec(dig(trader, "pnl", "token", "realized"))
+        except Exception as exc:
+            log.error(
+                "mint=- wallet=%s status=error reason=%s phase=payload",
+                _wallet_label(trader), type(exc).__name__,
+            )
+            continue
+        if value is not None:
+            realized.append(value)
+    return min(realized, default=None)
+
+
+def _keep_page(traders, mint):
+    """Drop poison trader rows without dropping the rest of the page."""
+    kept = []
+    for trader in traders:
+        try:
+            if _keep_trader(trader):
+                kept.append(trader)
+        except Exception as exc:
+            log.error(
+                "mint=%s wallet=%s status=error reason=%s phase=payload",
+                mint, _wallet_label(trader), type(exc).__name__,
+            )
+    return kept
+
+
+def fetch(client, key, mint, sleep=None):
     out = []
     cursor = None
     page = 0
@@ -463,34 +677,49 @@ def fetch(client, key, mint):
         }
         if cursor:
             q["cursor"] = cursor
-        try:
-            r = client.get(
+
+        def _get(params=q):
+            response = client.get(
                 f"{TRACKER_BASE}/v2/pnl/tokens/{quote(mint, safe='')}/traders",
-                params=q,
+                params=params,
                 headers={"x-api-key": key},
                 timeout=45,
             )
-            r.raise_for_status()
+            response.raise_for_status()
+            return response
+
+        try:
+            # Type only on failure. httpx messages can echo the request, including the key.
+            response = retry_call(
+                _get, sleep=sleep, label=f"tracker mint={mint} page={page}",
+            )
         except Exception as exc:
-            # Type only. httpx messages can echo the request, including the key.
             log.error(
                 "tracker page=%s failed reason=%s",
                 page, type(exc).__name__,
             )
             raise
-        body = r.json()
+        try:
+            body = response.json()
+        except Exception as exc:
+            log.error(
+                "tracker page=%s failed reason=%s",
+                page, type(exc).__name__,
+            )
+            raise
+        if not isinstance(body, dict):
+            log.error("tracker page=%s failed reason=bad_payload", page)
+            raise ValueError("bad_payload")
         traders = body.get("traders") or []
-        kept = [t for t in traders if _keep_trader(t)]
+        if not isinstance(traders, list):
+            log.error("tracker page=%s failed reason=bad_payload", page)
+            raise ValueError("bad_payload")
+        kept = _keep_page(traders, mint)
         out.extend(kept)
         pg = body.get("pagination") or {}
-        floor = min(
-            (
-                dec(dig(t, "pnl", "token", "realized"))
-                for t in traders
-                if dec(dig(t, "pnl", "token", "realized")) is not None
-            ),
-            default=None,
-        )
+        if not isinstance(pg, dict):
+            pg = {}
+        floor = _page_floor(traders)
         cursor = pg.get("nextCursor")
         has_more = bool(pg.get("hasMore"))
         log.info(
@@ -506,139 +735,400 @@ def fetch(client, key, mint):
     return out, page
 
 
-def run_harvest(conn, mint_override):
-    cur = conn.cursor()
-    if mint_override:
+# Best ranking already on the success book: roi_multiple, then recency, then id.
+# One row per mint (the highest ROI outcome). Tracker realized PnL ranks
+# traders inside a mint after this choice; it is not a mint rank.
+RANKED_MINTS_SQL = (
+    "SELECT r.id, r.token_address, r.roi_multiple, r.detected_at, s.status "
+    "FROM ("
+    "SELECT DISTINCT ON (o.token_address) "
+    "o.id, o.token_address, o.roi_multiple, o.detected_at "
+    "FROM wallet_intel.telegram_call_outcomes o "
+    "WHERE (o.chain IS NULL OR left(lower(o.chain), 3) = 'sol') "
+    "AND COALESCE(o.is_success, o.roi_multiple >= 2) = true "
+    "AND o.roi_multiple >= 2 AND o.token_address IS NOT NULL "
+    "ORDER BY o.token_address, o.roi_multiple DESC NULLS LAST, "
+    "o.detected_at DESC NULLS LAST, o.id DESC"
+    ") r "
+    "LEFT JOIN wallet_intel.token_trader_scans s ON s.token_mint = r.token_address "
+    "ORDER BY r.roi_multiple DESC NULLS LAST, r.detected_at DESC NULLS LAST, r.id DESC"
+)
+
+POSITIONS_SQL = (
+    "INSERT INTO wallet_intel.wallet_token_positions "
+    "(wallet_address,token_address,current_balance,realized_usd,invested_usd,"
+    "proceeds_usd,roi,n_buys,n_sells,first_buy_at,last_sell_at,hold_secs,"
+    "career_trades,career_tokens,career_realized_usd,identity_type,identity_tags,"
+    "source,won,copy_ok,early) VALUES %s "
+    "ON CONFLICT (wallet_address,token_address) DO UPDATE SET "
+    "realized_usd=EXCLUDED.realized_usd,invested_usd=EXCLUDED.invested_usd,"
+    "proceeds_usd=EXCLUDED.proceeds_usd,roi=EXCLUDED.roi,n_buys=EXCLUDED.n_buys,"
+    "n_sells=EXCLUDED.n_sells,hold_secs=EXCLUDED.hold_secs,"
+    "career_trades=EXCLUDED.career_trades,career_tokens=EXCLUDED.career_tokens,"
+    "career_realized_usd=EXCLUDED.career_realized_usd,"
+    "identity_type=EXCLUDED.identity_type,identity_tags=EXCLUDED.identity_tags,"
+    "source=EXCLUDED.source,won=EXCLUDED.won,copy_ok=EXCLUDED.copy_ok,"
+    "early=EXCLUDED.early,updated_at=now()"
+)
+
+SCAN_SQL = (
+    "INSERT INTO wallet_intel.token_trader_scans "
+    "(token_mint,first_outcome_id,roi_at_scan,pages_fetched,wallets_upserted,"
+    "green_usd,status) VALUES (%s,%s,%s,%s,%s,%s,%s) "
+    "ON CONFLICT (token_mint) DO UPDATE SET "
+    "first_outcome_id=COALESCE(wallet_intel.token_trader_scans.first_outcome_id,"
+    "EXCLUDED.first_outcome_id),"
+    "roi_at_scan=EXCLUDED.roi_at_scan,scanned_at=now(),"
+    "pages_fetched=EXCLUDED.pages_fetched,wallets_upserted=EXCLUDED.wallets_upserted,"
+    "green_usd=EXCLUDED.green_usd,status=EXCLUDED.status"
+)
+
+HARVEST_SQL = (
+    "INSERT INTO public.tracked_wallets "
+    "(wallet_address,name,source,is_active,wallet_tier,notes) "
+    "SELECT wallet_address,'tracker','tracker_traders',false,'tier_4','harvest' "
+    "FROM wallet_intel.v_repeat_winners "
+    "ON CONFLICT (wallet_address) DO UPDATE SET "
+    "last_imported_at=now(),updated_at=now()"
+)
+
+PROMOTE_SQL = (
+    "UPDATE public.tracked_wallets t SET is_active="
+    "(t.wallet_address IN ("
+    "SELECT wallet_address FROM wallet_intel.v_repeat_winners "
+    f"ORDER BY n_won DESC,pnl_won DESC NULLS LAST LIMIT {int(PROMOTE_CAP)}"
+    ")),updated_at=now() WHERE t.source='tracker_traders'"
+)
+
+
+def _identity_tags(trader):
+    tags = dig(trader, "identity", "tags") or []
+    if isinstance(tags, str):
+        return [tags]
+    if isinstance(tags, list):
+        return [str(tag) for tag in tags if tag is not None]
+    return []
+
+
+def position_row(trader, mint):
+    wallet = str(trader.get("wallet") or "").strip()
+    realized = dec(dig(trader, "pnl", "token", "realized"))
+    invested = dec(trader.get("invested", trader.get("buyUsd")))
+    proceeds = dec(trader.get("proceeds", trader.get("sellUsd")))
+    return (
+        wallet, mint, 0, realized, invested, proceeds, dec(trader.get("roi")),
+        dig(trader, "counts", "buys"), dig(trader, "counts", "sells"),
+        None, None, dec(dig(trader, "timing", "holdTimeSecs")),
+        dig(trader, "pnl", "wallet", "totalTrades"),
+        dig(trader, "pnl", "wallet", "tokensTraded"),
+        dec(dig(trader, "pnl", "wallet", "realized")),
+        dig(trader, "identity", "type"), _identity_tags(trader),
+        "tracker_traders", True, False, False,
+    )
+
+
+def rows_from_traders(traders, mint):
+    """Build position rows. One bad wallet is logged and skipped.
+
+    The second value is how many traders raised. A page of only failures
+    is an error scan, not an empty one.
+    """
+    rows = []
+    seen = set()
+    failures = 0
+    for trader in traders:
+        wallet = _wallet_label(trader)
+        try:
+            if not _keep_trader(trader):
+                continue
+            row = position_row(trader, mint)
+            wallet = row[0] or wallet
+            if not row[0] or row[0] in seen:
+                continue
+            seen.add(row[0])
+            rows.append(row)
+        except Exception as exc:
+            failures += 1
+            log.error(
+                "mint=%s wallet=%s status=error reason=%s phase=payload",
+                mint, wallet, type(exc).__name__,
+            )
+    return rows, failures
+
+
+def _green(rows):
+    total = Decimal(0)
+    for row in rows:
+        realized = row[3]
+        if isinstance(realized, Decimal):
+            total += realized
+    return total
+
+
+def _raise_if_fatal(conn, exc):
+    if is_fatal_ledger(exc) or connection_unusable(conn, exc):
+        raise FatalLedger(type(exc).__name__) from exc
+
+
+def write_scan(cur, mint, outcome_id, roi, pages, wallets, green, status, sleep=None):
+    def _write():
         cur.execute(
-            "SELECT 1 FROM wallet_intel.token_trader_scans WHERE token_mint=%s",
-            (mint_override,),
+            SCAN_SQL,
+            (mint, outcome_id, roi, pages, wallets, green, status),
         )
-        if cur.fetchone():
+
+    retry_call(_write, sleep=sleep, label=f"ledger mint={mint}")
+
+
+def upsert_positions(conn, cur, rows, mint, sleep=None):
+    """Insert the page as a batch. A bad row falls back to per-wallet savepoints.
+
+    A statement timeout does not fan out into one timeout per wallet.
+    """
+    if not rows:
+        return []
+
+    def _batch():
+        execute_values(cur, POSITIONS_SQL, rows, page_size=200)
+
+    try:
+        retry_call(_batch, sleep=sleep, label=f"upsert mint={mint}")
+        return list(rows)
+    except Exception as exc:
+        _raise_if_fatal(conn, exc)
+        if isinstance(exc, psycopg2.errors.QueryCanceled) or is_transient(exc):
+            raise
+        if not isinstance(exc, (psycopg2.DataError, psycopg2.ProgrammingError, psycopg2.IntegrityError)):
+            raise
+        log.error(
+            "mint=%s status=error reason=%s phase=upsert_batch",
+            mint, type(exc).__name__,
+        )
+        rollback_quietly(conn)
+        written = []
+        for row in rows:
+            wallet = row[0]
+            try:
+                cur.execute("SAVEPOINT discover_wallet")
+                execute_values(cur, POSITIONS_SQL, [row], page_size=1)
+                cur.execute("RELEASE SAVEPOINT discover_wallet")
+                written.append(row)
+            except Exception as row_exc:
+                log.error(
+                    "mint=%s wallet=%s status=error reason=%s phase=upsert",
+                    mint, wallet, type(row_exc).__name__,
+                )
+                try:
+                    cur.execute("ROLLBACK TO SAVEPOINT discover_wallet")
+                except Exception:
+                    rollback_quietly(conn)
+                    _raise_if_fatal(conn, row_exc)
+                _raise_if_fatal(conn, row_exc)
+        return written
+
+
+def harvest_one(conn, cur, key, outcome_id, mint, roi, sleep=None):
+    """Harvest one mint. Raises FatalLedger only when the ledger cannot be written."""
+    try:
+        with httpx.Client() as client:
+            traders, pages = fetch(client, key, mint, sleep=sleep)
+        rows, failures = rows_from_traders(traders, mint)
+        written = upsert_positions(conn, cur, rows, mint, sleep=sleep)
+        green = _green(written)
+        if written:
+            status = "ok"
+        elif failures or rows:
+            status = "error"
+        else:
+            status = "empty"
+        write_scan(
+            cur, mint, outcome_id, roi, pages, len(written), green, status, sleep=sleep,
+        )
+        conn.commit()
+        if status != "error":
+            log.info("upsert progress rows=%s green_usd=%s", len(written), green)
+        log.info(
+            "mint=%s pages=%s upserted=%s green_usd=%s status=%s",
+            mint, pages, len(written), green, status,
+        )
+        return status
+    except FatalLedger:
+        rollback_quietly(conn)
+        raise
+    except Exception as exc:
+        log.error(
+            "mint=%s status=error reason=%s phase=harvest",
+            mint, type(exc).__name__,
+        )
+        rollback_quietly(conn)
+        _raise_if_fatal(conn, exc)
+        try:
+            write_scan(cur, mint, outcome_id, roi, 0, 0, Decimal(0), "error", sleep=sleep)
+            conn.commit()
+        except Exception as ledger_exc:
+            log.error(
+                "mint=%s status=error reason=%s phase=ledger",
+                mint, type(ledger_exc).__name__,
+            )
+            rollback_quietly(conn)
+            _raise_if_fatal(conn, ledger_exc)
+        return "error"
+
+
+def select_mints(cur, mint_override, fraction, rescan, sleep=None):
+    """Return (chosen_rows, ranked_count). Empty chosen means exit 0."""
+    if mint_override:
+        def _status():
+            cur.execute(
+                "SELECT status FROM wallet_intel.token_trader_scans WHERE token_mint=%s",
+                (mint_override,),
+            )
+            return cur.fetchone()
+
+        found = retry_call(_status, sleep=sleep, label="scan status")
+        status = found[0] if found else None
+        if status in COMPLETED_SCAN_STATUSES and not rescan:
             log.info(
                 "mint=%s pages=0 upserted=0 tracker_calls=0 status=skip "
                 "reason=already_scanned",
                 mint_override,
             )
-            return 0
-        cur.execute(
-            "SELECT id,token_address,roi_multiple,detected_at "
-            "FROM wallet_intel.telegram_call_outcomes "
-            "WHERE token_address=%s "
-            "ORDER BY roi_multiple DESC NULLS LAST, detected_at DESC NULLS LAST, id DESC "
-            "LIMIT 1",
-            (mint_override,),
-        )
-    else:
-        cur.execute(
-            "SELECT o.id,o.token_address,o.roi_multiple,o.detected_at "
-            "FROM wallet_intel.telegram_call_outcomes o "
-            "WHERE (o.chain IS NULL OR o.chain ILIKE 'sol%') "
-            "AND COALESCE(o.is_success,o.roi_multiple>=2)=true "
-            "AND o.roi_multiple>=2 AND o.token_address IS NOT NULL "
-            "AND NOT EXISTS ("
-            "SELECT 1 FROM wallet_intel.token_trader_scans s "
-            "WHERE s.token_mint=o.token_address"
-            ") "
-            "ORDER BY o.roi_multiple DESC,o.detected_at DESC NULLS LAST LIMIT 1"
-        )
-    choice = cur.fetchone()
-    if not choice:
+            return [], 0
+
+        def _outcome():
+            cur.execute(
+                "SELECT id,token_address,roi_multiple,detected_at "
+                "FROM wallet_intel.telegram_call_outcomes "
+                "WHERE token_address=%s "
+                "ORDER BY roi_multiple DESC NULLS LAST, detected_at DESC NULLS LAST, id DESC "
+                "LIMIT 1",
+                (mint_override,),
+            )
+            return cur.fetchone()
+
+        choice = retry_call(_outcome, sleep=sleep, label="mint override")
+        if not choice:
+            log.info("no unscanned mint; exit 0 reason=no_unscanned_mint")
+            return [], 0
+        return [choice + (status,)], 1
+
+    def _ranked():
+        cur.execute(RANKED_MINTS_SQL)
+        return cur.fetchall()
+
+    ranked = list(retry_call(_ranked, sleep=sleep, label="ranked mints"))
+    if not ranked:
         log.info("no unscanned mint; exit 0 reason=no_unscanned_mint")
+        return [], 0
+    chosen = choose_batch(ranked, fraction, rescan)
+    if not chosen:
+        log.info(
+            "no unscanned mint; exit 0 reason=top_quintile_already_scanned"
+        )
+        return [], len(ranked)
+    return chosen, len(ranked)
+
+
+def sync_tracked_wallets(conn, cur, sleep=None):
+    """Insert tracker winners inactive, then apply the existing promote cap.
+
+    is_active stays false on insert. The promote update only turns on wallets
+    that already qualify inside v_repeat_winners, capped at PROMOTE_CAP.
+    A larger mint batch does not loosen that rule.
+    """
+    try:
+        def _harvest():
+            cur.execute(HARVEST_SQL)
+            return cur.rowcount
+
+        harvested = retry_call(_harvest, sleep=sleep, label="harvest tracked_wallets")
+        conn.commit()
+        log.info(
+            "harvest summary rows=%s source=tracker_traders",
+            harvested,
+        )
+
+        def _promote():
+            cur.execute(PROMOTE_SQL)
+            return cur.rowcount
+
+        promoted = retry_call(_promote, sleep=sleep, label="promote tracked_wallets")
+        conn.commit()
+        log.info(
+            "promote summary cap=%s rows_updated=%s source=tracker_traders",
+            PROMOTE_CAP, promoted,
+        )
         return 0
-    oid, mint, roi, _detected = choice
-    log.info("mint selected mint=%s outcome_id=%s roi=%s", mint, oid, roi)
+    except Exception as exc:
+        log.error(
+            "status=error reason=%s phase=promote",
+            type(exc).__name__,
+        )
+        rollback_quietly(conn)
+        if is_fatal_ledger(exc) or connection_unusable(conn, exc):
+            return 1
+        return 0
+
+
+def run_harvest(conn, mint_override, sleep=None):
+    cur = conn.cursor()
+    fraction = top_fraction()
+    rescan = rescan_enabled()
+    try:
+        chosen, ranked_n = select_mints(
+            cur, mint_override, fraction, rescan, sleep=sleep,
+        )
+    except FatalLedger as exc:
+        log.error("status=error reason=%s phase=fatal", exc)
+        return 1
+    except Exception as exc:
+        log.error("status=error reason=%s phase=select", type(exc).__name__)
+        rollback_quietly(conn)
+        if is_fatal_ledger(exc) or connection_unusable(conn, exc):
+            return 1
+        return 0
+    if not chosen:
+        return 0
+    shown_fraction = "override" if mint_override else fraction
+    log.info(
+        "batch selected ranked=%s quintile=%s chosen=%s fraction=%s rescan=%s",
+        ranked_n,
+        len(chosen) if mint_override else quintile_size(ranked_n, fraction),
+        len(chosen),
+        shown_fraction,
+        str(rescan).lower(),
+    )
     key = os.getenv("SOLANA_TRACKER_API_KEY", "")
+    for outcome_id, mint, roi, _detected, _status in chosen:
+        log.info("mint selected mint=%s outcome_id=%s roi=%s", mint, outcome_id, roi)
     if not key:
         log.error(
             "mint=%s status=error reason=SOLANA_TRACKER_API_KEY_unset",
-            mint,
+            chosen[0][1],
         )
         return 1
-    with httpx.Client() as client:
-        traders, pages = fetch(client, key, mint)
-    rows = []
-    seen = set()
-    for t in traders:
-        w = str(t.get("wallet") or "").strip()
-        if not w or w in seen:
-            continue
-        seen.add(w)
-        realized = dec(dig(t, "pnl", "token", "realized"))
-        invested = dec(t.get("invested", t.get("buyUsd")))
-        proceeds = dec(t.get("proceeds", t.get("sellUsd")))
-        rows.append((
-            w, mint, 0, realized, invested, proceeds, dec(t.get("roi")),
-            dig(t, "counts", "buys"), dig(t, "counts", "sells"),
-            None, None, dec(dig(t, "timing", "holdTimeSecs")),
-            dig(t, "pnl", "wallet", "totalTrades"),
-            dig(t, "pnl", "wallet", "tokensTraded"),
-            dec(dig(t, "pnl", "wallet", "realized")),
-            dig(t, "identity", "type"), dig(t, "identity", "tags") or [],
-            "tracker_traders", True, False, False,
-        ))
-    if rows:
-        execute_values(
-            cur,
-            "INSERT INTO wallet_intel.wallet_token_positions "
-            "(wallet_address,token_address,current_balance,realized_usd,invested_usd,"
-            "proceeds_usd,roi,n_buys,n_sells,first_buy_at,last_sell_at,hold_secs,"
-            "career_trades,career_tokens,career_realized_usd,identity_type,identity_tags,"
-            "source,won,copy_ok,early) VALUES %s "
-            "ON CONFLICT (wallet_address,token_address) DO UPDATE SET "
-            "realized_usd=EXCLUDED.realized_usd,invested_usd=EXCLUDED.invested_usd,"
-            "proceeds_usd=EXCLUDED.proceeds_usd,roi=EXCLUDED.roi,n_buys=EXCLUDED.n_buys,"
-            "n_sells=EXCLUDED.n_sells,hold_secs=EXCLUDED.hold_secs,"
-            "career_trades=EXCLUDED.career_trades,career_tokens=EXCLUDED.career_tokens,"
-            "career_realized_usd=EXCLUDED.career_realized_usd,"
-            "identity_type=EXCLUDED.identity_type,identity_tags=EXCLUDED.identity_tags,"
-            "source=EXCLUDED.source,won=EXCLUDED.won,copy_ok=EXCLUDED.copy_ok,"
-            "early=EXCLUDED.early,updated_at=now()",
-            rows,
-            page_size=200,
-        )
-    green = sum((r[3] for r in rows), Decimal(0))
-    status = "ok" if rows else "empty"
-    cur.execute(
-        "INSERT INTO wallet_intel.token_trader_scans "
-        "(token_mint,first_outcome_id,roi_at_scan,pages_fetched,wallets_upserted,"
-        "green_usd,status) VALUES (%s,%s,%s,%s,%s,%s,%s) "
-        "ON CONFLICT (token_mint) DO NOTHING",
-        (mint, oid, roi, pages, len(rows), green, status),
-    )
-    conn.commit()
-    log.info("upsert progress rows=%s green_usd=%s", len(rows), green)
-    cur.execute(
-        "INSERT INTO public.tracked_wallets "
-        "(wallet_address,name,source,is_active,wallet_tier,notes) "
-        "SELECT wallet_address,'tracker','tracker_traders',false,'tier_4','harvest' "
-        "FROM wallet_intel.v_repeat_winners "
-        "ON CONFLICT (wallet_address) DO UPDATE SET "
-        "last_imported_at=now(),updated_at=now()"
-    )
-    harvested = cur.rowcount
-    conn.commit()
+    counts = {"ok": 0, "empty": 0, "error": 0}
+    for outcome_id, mint, roi, _detected, _status in chosen:
+        try:
+            status = harvest_one(
+                conn, cur, key, outcome_id, mint, roi, sleep=sleep,
+            )
+        except FatalLedger as exc:
+            log.error(
+                "mint=%s status=error reason=%s phase=fatal",
+                mint, exc,
+            )
+            log.info(
+                "batch summary selected=%s ok=%s empty=%s error=%s",
+                len(chosen), counts["ok"], counts["empty"], counts["error"] + 1,
+            )
+            return 1
+        counts[status] = counts.get(status, 0) + 1
     log.info(
-        "harvest summary rows=%s source=tracker_traders",
-        harvested,
+        "batch summary selected=%s ok=%s empty=%s error=%s",
+        len(chosen), counts["ok"], counts["empty"], counts["error"],
     )
-    cur.execute(
-        f"UPDATE public.tracked_wallets t SET is_active="
-        f"(t.wallet_address IN ("
-        f"SELECT wallet_address FROM wallet_intel.v_repeat_winners "
-        f"ORDER BY n_won DESC,pnl_won DESC NULLS LAST LIMIT {PROMOTE_CAP}"
-        f")),updated_at=now() WHERE t.source='tracker_traders'"
-    )
-    promoted = cur.rowcount
-    conn.commit()
-    log.info(
-        "promote summary cap=%s rows_updated=%s source=tracker_traders",
-        PROMOTE_CAP, promoted,
-    )
-    log.info(
-        "mint=%s pages=%s upserted=%s green_usd=%s status=%s",
-        mint, pages, len(rows), green, status,
-    )
-    return 0
+    return sync_tracked_wallets(conn, cur, sleep=sleep)
 
 
 def main(argv=None):
