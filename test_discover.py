@@ -3,6 +3,7 @@ import logging
 import os
 import sys
 import unittest
+from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from unittest import mock
@@ -20,6 +21,9 @@ def _clear_run_flags():
         "DISCOVER_RESCAN",
         "DISCOVER_TOP_FRACTION",
         "DISCOVER_WINDOW_HOURS",
+        "DISCOVER_PROMOTE_CAP",
+        "DISCOVER_BACKFILL_POSITIONS",
+        "DISCOVER_BACKFILL_LIMIT",
         "MATRIX_RUN",
     ):
         os.environ.pop(name, None)
@@ -290,8 +294,17 @@ class ProgressLogTest(unittest.TestCase):
         blob = "\n".join(captured.output)
         self.assertIn("mint selected mint=MintABC outcome_id=9 roi=3.5", blob)
         self.assertIn("upsert progress rows=1 green_usd=25", blob)
-        self.assertIn("harvest summary rows=4 source=tracker_traders", blob)
+        self.assertIn(
+            "harvest summary rows=4 source=tracker_traders min_mints=1",
+            blob,
+        )
         self.assertIn("promote summary cap=100 rows_updated=7 source=tracker_traders", blob)
+        self.assertIn("mint=MintABC early=0 copy_ok=0", blob)
+        self.assertIn(
+            "discovery summary scanned_mints_kept=0 positions_total=0 "
+            "positions_copy_ok=0 harvest_rows=4 promote_activated=0",
+            blob,
+        )
         self.assertIn("mint=MintABC pages=2 upserted=1 green_usd=25 status=ok", blob)
         self.assertNotIn("super-secret-key", blob)
 
@@ -299,7 +312,7 @@ class ProgressLogTest(unittest.TestCase):
         cursor = _Cursor([("ok",)])
         with self.assertLogs("discover", level="INFO") as captured:
             self.assertEqual(discover.run_harvest(_Conn(cursor), "MintABC"), 0)
-        self.assertEqual(len(cursor.calls), 1)
+        self.assertEqual(len(cursor.calls), 2)
         self.assertIn(
             "status=skip reason=already_scanned",
             "\n".join(captured.output),
@@ -428,8 +441,12 @@ class QuintileAndIsolationTest(unittest.TestCase):
         )
         self.assertNotIn("detected_at", discover.RANKED_MINTS_SQL)
         self.assertNotIn("LIMIT", discover.RANKED_MINTS_SQL)
-        self.assertIn("'tracker_traders',false,", discover.HARVEST_SQL.replace(" ", ""))
-        self.assertIn("LIMIT 100", discover.PROMOTE_SQL)
+        harvest = discover.harvest_sql(2, 100).replace(" ", "")
+        self.assertIn("'tracker_traders',true,", harvest)
+        self.assertNotIn("'tracker_traders',false,", harvest)
+        self.assertIn("LIMIT 100", discover.promote_sql(2, 100))
+        self.assertIn("WHERE t.source='tracker_traders'", discover.promote_sql(2, 100))
+        self.assertNotIn("gmgn", discover.promote_sql(2, 100).lower())
 
     def test_bad_wallet_is_skipped_and_the_good_wallet_remains(self):
         traders = [
@@ -848,6 +865,168 @@ class ConnectModeTest(unittest.TestCase):
                         self.assertEqual(discover.main([]), 0)
         run_matrix.assert_called_once()
         run_harvest.assert_not_called()
+
+
+class ScoreAndRetentionTest(unittest.TestCase):
+    def _call(self, **delta):
+        return datetime(2026, 10, 6, 12, 0, tzinfo=timezone.utc) + timedelta(**delta)
+
+    def _trader(self, **overrides):
+        called = self._call()
+        first_buy = int((called - timedelta(minutes=5)).timestamp() * 1000)
+        trader = {
+            "wallet": "Human",
+            "invested": "100",
+            "proceeds": "300",
+            "roi": "200",
+            "pnl": {
+                "token": {"realized": "200"},
+                "wallet": {"totalTrades": 40, "tokensTraded": 12, "realized": "500"},
+            },
+            "counts": {"buys": 2, "sells": 2},
+            "timing": {
+                "firstBuy": first_buy,
+                "lastSell": first_buy + 600_000,
+                "holdTimeSecs": 600,
+            },
+            "identity": {"type": "kol", "tags": ["kol"]},
+        }
+        trader.update(overrides)
+        return trader
+
+    def test_early_window_and_copy_ok(self):
+        called = self._call()
+        row = discover.position_row(self._trader(), "MintA", called)
+        self.assertTrue(row[discover.COL_EARLY])
+        self.assertTrue(row[discover.COL_COPY_OK])
+        self.assertTrue(row[18])
+        self.assertEqual(row[1], "MintA")
+
+        late = self._trader()
+        late["timing"] = dict(late["timing"])
+        late["timing"]["firstBuy"] = int(
+            (called + timedelta(minutes=10, seconds=1)).timestamp() * 1000
+        )
+        late_row = discover.position_row(late, "MintA", called)
+        self.assertFalse(late_row[discover.COL_EARLY])
+        self.assertFalse(late_row[discover.COL_COPY_OK])
+
+        edge = self._trader()
+        edge["timing"] = dict(edge["timing"])
+        edge["timing"]["firstBuy"] = int(
+            (called - timedelta(minutes=60)).timestamp() * 1000
+        )
+        self.assertTrue(discover.position_row(edge, "MintA", called)[discover.COL_EARLY])
+
+        too_soon = self._trader()
+        too_soon["timing"] = dict(too_soon["timing"])
+        too_soon["timing"]["firstBuy"] = int(
+            (called - timedelta(minutes=60, seconds=1)).timestamp() * 1000
+        )
+        self.assertFalse(
+            discover.position_row(too_soon, "MintA", called)[discover.COL_EARLY]
+        )
+
+    def test_snipe_and_identity_trap_are_not_copy_ok(self):
+        called = self._call()
+        sniper = self._trader()
+        sniper["timing"] = dict(sniper["timing"], holdTimeSecs=11)
+        sniper["roi"] = "4000"
+        row = discover.position_row(sniper, "MintA", called)
+        self.assertTrue(row[discover.COL_EARLY])
+        self.assertFalse(row[discover.COL_COPY_OK])
+
+        bot = self._trader(identity={"type": "bot", "tags": ["axiom", "bot"]})
+        self.assertTrue(discover.identity_trap(bot))
+        self.assertFalse(discover.position_row(bot, "MintA", called)[discover.COL_COPY_OK])
+
+        frontend = self._trader(identity={"type": "axiom", "tags": ["axiom", "photon"]})
+        self.assertFalse(discover.identity_trap(frontend))
+        self.assertTrue(discover.position_row(frontend, "MintA", called)[discover.COL_COPY_OK])
+
+        # A gmgn trading-app tag is not tracked_wallets source=gmgn.
+        gmgn_app = self._trader(identity={"type": "gmgn", "tags": ["gmgn"]})
+        self.assertTrue(discover.position_row(gmgn_app, "MintA", called)[discover.COL_COPY_OK])
+
+        career = self._trader()
+        career["pnl"] = {
+            "token": {"realized": "200"},
+            "wallet": {"totalTrades": 8000, "tokensTraded": 12, "realized": "500"},
+        }
+        self.assertFalse(discover.position_row(career, "MintA", called)[discover.COL_COPY_OK])
+
+    def test_missing_call_time_is_not_early(self):
+        row = discover.position_row(self._trader(), "MintA", None)
+        self.assertFalse(row[discover.COL_EARLY])
+        self.assertFalse(row[discover.COL_COPY_OK])
+
+    def test_repeat_threshold_and_single_mint_gate(self):
+        self.assertEqual(discover.repeat_mint_threshold(0), 1)
+        self.assertEqual(discover.repeat_mint_threshold(1), 1)
+        self.assertEqual(discover.repeat_mint_threshold(2), 2)
+        thin = discover.harvest_sql(1, 100)
+        thick = discover.harvest_sql(2, 100)
+        self.assertIn(">= 300", thin)
+        self.assertIn(">= 100", thin)
+        self.assertNotIn(">= 300", thick)
+        self.assertIn("COUNT(DISTINCT token_address) >= 2", thick)
+        self.assertIn("source='tracker_traders'", discover.promote_sql(1, 50))
+        self.assertIn("LIMIT 50", discover.promote_sql(1, 50))
+
+    def test_upsert_mint_a_then_mint_b_leaves_both(self):
+        store = {}
+
+        def execute_values(_cur, sql, rows, page_size=None):
+            self.assertNotIn("DELETE", sql.upper())
+            self.assertNotIn("TRUNCATE", sql.upper())
+            self.assertIn("ON CONFLICT (wallet_address,token_address)", sql)
+            update = sql.split("DO UPDATE SET", 1)[1]
+            self.assertNotIn("token_address=", update)
+            for row in rows:
+                store[(row[0], row[1])] = row
+
+        with mock.patch("discover.execute_values", side_effect=execute_values):
+            discover.upsert_positions(mock.Mock(), mock.Mock(), [
+                discover.position_row(
+                    {"wallet": "W", "pnl": {"token": {"realized": "10"}}}, "MintA",
+                ),
+                discover.position_row(
+                    {"wallet": "OnlyA", "pnl": {"token": {"realized": "8"}}}, "MintA",
+                ),
+            ], "MintA")
+            discover.upsert_positions(mock.Mock(), mock.Mock(), [
+                discover.position_row(
+                    {"wallet": "W", "pnl": {"token": {"realized": "12"}}}, "MintB",
+                ),
+            ], "MintB")
+        self.assertEqual(
+            set(store),
+            {("W", "MintA"), ("OnlyA", "MintA"), ("W", "MintB")},
+        )
+        self.assertEqual(store[("W", "MintA")][3], Decimal("10"))
+        self.assertEqual(store[("W", "MintB")][3], Decimal("12"))
+
+    def test_position_sql_never_deletes_other_mints(self):
+        self.assertNotIn("DELETE", discover.POSITIONS_SQL.upper())
+        self.assertNotIn("TRUNCATE", discover.POSITIONS_SQL.upper())
+        self.assertIn("first_buy_at=EXCLUDED.first_buy_at", discover.POSITIONS_SQL)
+        self.assertNotIn("DELETE", discover.BACKFILL_SQL.upper())
+        self.assertIn("first_buy_at IS NOT NULL", discover.BACKFILL_SQL)
+
+    def test_rebuild_keeps_tracker_rows_across_truncate(self):
+        text = (
+            Path(__file__).resolve().parent / "migrations" / "20261006_keep_tracker_positions.sql"
+        ).read_text()
+        self.assertLess(
+            text.index("CREATE TEMP TABLE _tracker_keep"),
+            text.index("TRUNCATE wallet_intel.wallet_token_positions"),
+        )
+        self.assertLess(
+            text.index("TRUNCATE wallet_intel.wallet_token_positions"),
+            text.index("SELECT * FROM _tracker_keep"),
+        )
+        self.assertIn("source = 'tracker_traders'", text)
+        self.assertIn("COALESCE(p.source, '') <> 'tracker_traders'", text)
 
 
 if __name__ == "__main__":

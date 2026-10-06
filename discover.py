@@ -4,6 +4,11 @@
 One mint's tracker, payload, or database failure is logged and skipped.
 The process exits 0 after a partial batch. Connect failure and a ledger
 that cannot be written at all still exit 1.
+
+Positions are upserted on (wallet_address, token_address) only. This
+process never deletes or truncates other mints. The nightly
+wallet_intel.rebuild_wallet_positions() used to TRUNCATE the table;
+migrations/20261006_keep_tracker_positions.sql puts tracker rows back.
 """
 from __future__ import annotations
 
@@ -42,6 +47,26 @@ TRACKER_BASE = "https://data.solanatracker.io"
 PAGE_LIMIT, MAX_PAGES = 20, 23
 REALIZED_FLOOR_USD = Decimal("50")
 PROMOTE_CAP = 100
+# first_buy_at within this window of the telegram call. This book has no
+# token-launch timestamp (detected_at is null), so the call is the anchor.
+# 60 minutes before covers a launch the call follows. 10 minutes after is
+# still the opening push. Later buyers are chasers, not early.
+EARLY_BEFORE_CALL = timedelta(minutes=60)
+EARLY_AFTER_CALL = timedelta(minutes=10)
+# Hold below a minute is a snipe: on the USEFUL scan, 30 of 160 profitable
+# wallets held under 30 seconds. Zero-hold absurd ROI is not copyable.
+MIN_HOLD_SECS = Decimal("60")
+# Thin history (fewer than 2 mints with any copy_ok row) uses N=1 plus these.
+SINGLE_MINT_MIN_REALIZED_USD = Decimal("100")
+SINGLE_MINT_MIN_ROI_PERCENT = Decimal("100")
+SINGLE_MINT_MIN_HOLD_SECS = Decimal("300")
+CAREER_TOKENS_MAX = 2000
+CAREER_TRADES_MAX = 8000
+REPEAT_MINTS = 2
+DEFAULT_BACKFILL_LIMIT = 8
+# Tuple slots written by position_row. Upsert SQL lists the same order.
+COL_COPY_OK = 19
+COL_EARLY = 20
 # Leading quintile of the rolling success window. DISCOVER_TOP_FRACTION overrides this.
 DEFAULT_TOP_FRACTION = 0.20
 # Outcomes older than this are outside the batch. DISCOVER_WINDOW_HOURS overrides it.
@@ -93,6 +118,62 @@ def test_enabled():
 def run_mode():
     """'test' for a one-shot label, otherwise 'cron'."""
     return "test" if test_enabled() else "cron"
+
+
+def promote_cap(value=None):
+    """How many tracker_traders wallets may stay active. Default 100.
+
+    DISCOVER_PROMOTE_CAP overrides it. Non-numeric, zero, and negative
+    values log a warning and use 100. gmgn rows are never in this set.
+    """
+    if value is None:
+        value = os.getenv("DISCOVER_PROMOTE_CAP")
+    if value is None or str(value).strip() == "":
+        return PROMOTE_CAP
+    try:
+        number = int(str(value).strip())
+    except ValueError:
+        log.warning("DISCOVER_PROMOTE_CAP invalid value; using %s", PROMOTE_CAP)
+        return PROMOTE_CAP
+    if number < 1:
+        log.warning("DISCOVER_PROMOTE_CAP out of range; using %s", PROMOTE_CAP)
+        return PROMOTE_CAP
+    return number
+
+
+def backfill_enabled(value=None):
+    """True when this start should refill mints whose positions were wiped.
+
+    DISCOVER_BACKFILL_POSITIONS is a one-shot. It re-reads Tracker only for
+    ledgered ok mints that have no scored tracker positions. Cron leaves it
+    unset; the next scheduled runs accumulate new mints on their own.
+    """
+    if value is None:
+        value = os.getenv("DISCOVER_BACKFILL_POSITIONS")
+    return flag_truthy(value)
+
+
+def backfill_limit(value=None):
+    """How many missing-position mints one backfill start may re-scan. Default 8."""
+    if value is None:
+        value = os.getenv("DISCOVER_BACKFILL_LIMIT")
+    if value is None or str(value).strip() == "":
+        return DEFAULT_BACKFILL_LIMIT
+    try:
+        number = int(str(value).strip())
+    except ValueError:
+        log.warning(
+            "DISCOVER_BACKFILL_LIMIT invalid value; using %s",
+            DEFAULT_BACKFILL_LIMIT,
+        )
+        return DEFAULT_BACKFILL_LIMIT
+    if number < 1 or number > 32:
+        log.warning(
+            "DISCOVER_BACKFILL_LIMIT out of range; using %s",
+            DEFAULT_BACKFILL_LIMIT,
+        )
+        return DEFAULT_BACKFILL_LIMIT
+    return number
 
 
 def rescan_enabled(value=None):
@@ -876,7 +957,8 @@ POSITIONS_SQL = (
     "career_realized_usd=EXCLUDED.career_realized_usd,"
     "identity_type=EXCLUDED.identity_type,identity_tags=EXCLUDED.identity_tags,"
     "source=EXCLUDED.source,won=EXCLUDED.won,copy_ok=EXCLUDED.copy_ok,"
-    "early=EXCLUDED.early,updated_at=now()"
+    "early=EXCLUDED.early,first_buy_at=EXCLUDED.first_buy_at,"
+    "last_sell_at=EXCLUDED.last_sell_at,updated_at=now()"
 )
 
 SCAN_SQL = (
@@ -891,22 +973,131 @@ SCAN_SQL = (
     "green_usd=EXCLUDED.green_usd,status=EXCLUDED.status"
 )
 
-HARVEST_SQL = (
-    "INSERT INTO public.tracked_wallets "
-    "(wallet_address,name,source,is_active,wallet_tier,notes) "
-    "SELECT wallet_address,'tracker','tracker_traders',false,'tier_4','harvest' "
-    "FROM wallet_intel.v_repeat_winners "
-    "ON CONFLICT (wallet_address) DO UPDATE SET "
-    "last_imported_at=now(),updated_at=now()"
+# Mints that already have a scored tracker position. Below 2, harvest uses
+# the single-mint gate. This does not count unscored rows left by an older run.
+COPY_OK_MINTS_SQL = (
+    "SELECT COUNT(DISTINCT token_address)::int "
+    "FROM wallet_intel.wallet_token_positions "
+    "WHERE source='tracker_traders' AND copy_ok IS TRUE"
 )
 
-PROMOTE_SQL = (
-    "UPDATE public.tracked_wallets t SET is_active="
-    "(t.wallet_address IN ("
-    "SELECT wallet_address FROM wallet_intel.v_repeat_winners "
-    f"ORDER BY n_won DESC,pnl_won DESC NULLS LAST LIMIT {int(PROMOTE_CAP)}"
-    ")),updated_at=now() WHERE t.source='tracker_traders'"
+SUMMARY_SQL = (
+    "SELECT COUNT(DISTINCT token_address)::int, COUNT(*)::int, "
+    "COUNT(*) FILTER (WHERE copy_ok)::int "
+    "FROM wallet_intel.wallet_token_positions "
+    "WHERE source='tracker_traders'"
 )
+
+ACTIVATED_SQL = (
+    "SELECT count(*)::int FROM public.tracked_wallets "
+    "WHERE source='tracker_traders' AND is_active IS TRUE"
+)
+
+# Ledgered ok mints with no scored tracker positions. Re-hit Tracker only
+# for these, newest first, capped by DISCOVER_BACKFILL_LIMIT.
+BACKFILL_SQL = (
+    "SELECT o.id, s.token_mint, COALESCE(s.roi_at_scan, o.roi_multiple), "
+    "o.message_timestamp, s.status "
+    "FROM wallet_intel.token_trader_scans s "
+    "LEFT JOIN LATERAL ("
+    "SELECT id, roi_multiple, message_timestamp "
+    "FROM wallet_intel.telegram_call_outcomes "
+    "WHERE token_address = s.token_mint "
+    "ORDER BY roi_multiple DESC NULLS LAST, message_timestamp DESC NULLS LAST, id DESC "
+    "LIMIT 1"
+    ") o ON true "
+    "WHERE s.status = 'ok' "
+    "AND NOT EXISTS ("
+    "SELECT 1 FROM wallet_intel.wallet_token_positions p "
+    "WHERE p.token_address = s.token_mint AND p.source = 'tracker_traders' "
+    "AND p.first_buy_at IS NOT NULL"
+    ") "
+    "ORDER BY s.scanned_at DESC "
+    "LIMIT %s"
+)
+
+# Trading frontends are not traps. bot / pool / developer / exchange are.
+_TRAP_LABELS = frozenset({
+    "bot", "arbitrage", "arb", "mev", "sniper",
+    "hacker", "spam_dusting", "spam-dusting", "spamdusting",
+    "exchange", "pool", "developer",
+})
+_TRAP_OBJECTS = ("bot", "hacker", "spamDusting", "exchange", "pool")
+
+
+def repeat_mint_threshold(scored_mints):
+    """N for the copy_ok cohort. 2 once two scored mints exist, else 1."""
+    try:
+        count = int(scored_mints)
+    except (TypeError, ValueError):
+        count = 0
+    if count >= REPEAT_MINTS:
+        return REPEAT_MINTS
+    return 1
+
+
+def _winner_subquery(min_mints, cap):
+    """copy_ok wallets across min_mints winning tokens, capped.
+
+    min_mints=1 adds a stronger single-mint gate: realized USD, ROI percent,
+    and a 5 minute hold. source gmgn is not selected; this reads positions.
+    """
+    mints = int(min_mints)
+    limit = int(cap)
+    extra = ""
+    if mints < REPEAT_MINTS:
+        extra = (
+            " AND COALESCE(SUM(realized_usd),0) >= "
+            f"{SINGLE_MINT_MIN_REALIZED_USD}"
+            " AND COALESCE(MAX(roi),0) >= "
+            f"{SINGLE_MINT_MIN_ROI_PERCENT}"
+            " AND COALESCE(MAX(hold_secs),0) >= "
+            f"{SINGLE_MINT_MIN_HOLD_SECS}"
+        )
+    return (
+        "SELECT wallet_address FROM wallet_intel.wallet_token_positions "
+        "WHERE copy_ok IS TRUE AND won IS TRUE AND source='tracker_traders' "
+        "GROUP BY wallet_address "
+        f"HAVING COUNT(DISTINCT token_address) >= {mints} "
+        f"AND (MAX(career_tokens) IS NULL OR MAX(career_tokens) < {CAREER_TOKENS_MAX}) "
+        f"AND (MAX(career_trades) IS NULL OR MAX(career_trades) < {CAREER_TRADES_MAX})"
+        f"{extra} "
+        "ORDER BY COUNT(DISTINCT token_address) DESC, "
+        "SUM(realized_usd) DESC NULLS LAST "
+        f"LIMIT {limit}"
+    )
+
+
+def harvest_sql(min_mints, cap):
+    """Insert tracker winners active. An existing gmgn row is left unchanged.
+
+    ON CONFLICT only updates rows already source='tracker_traders'. A new
+    insert sets is_active=true in this statement. Do not rely on a trigger.
+    """
+    winners = _winner_subquery(min_mints, cap)
+    return (
+        "INSERT INTO public.tracked_wallets "
+        "(wallet_address,name,source,is_active,wallet_tier,notes) "
+        "SELECT wallet_address,'tracker','tracker_traders',true,'tier_4','harvest' "
+        f"FROM ({winners}) winners "
+        "ON CONFLICT (wallet_address) DO UPDATE SET "
+        "is_active=true,last_imported_at=now(),updated_at=now() "
+        "WHERE public.tracked_wallets.source='tracker_traders'"
+    )
+
+
+def promote_sql(min_mints, cap):
+    """Turn tracker_traders inside the cap on, and the rest of that source off.
+
+    The WHERE clause is source='tracker_traders' only. source gmgn is never
+    set is_active=true by this statement.
+    """
+    winners = _winner_subquery(min_mints, cap)
+    return (
+        "UPDATE public.tracked_wallets t SET is_active="
+        f"(t.wallet_address IN ({winners})),updated_at=now() "
+        "WHERE t.source='tracker_traders'"
+    )
 
 
 def _identity_tags(trader):
@@ -918,24 +1109,117 @@ def _identity_tags(trader):
     return []
 
 
-def position_row(trader, mint):
+def _as_int(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def epoch_to_utc(value):
+    """Tracker timing fields are Unix milliseconds. Small numbers are seconds."""
+    number = dec(value)
+    if number is None:
+        return None
+    raw = float(number)
+    if raw > 10_000_000_000:
+        raw = raw / 1000.0
+    if raw <= 0:
+        return None
+    try:
+        return datetime.fromtimestamp(raw, tz=timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def is_early(first_buy_at, called_at):
+    """True when the first buy sits in the call window. Missing times are not early."""
+    buy = _as_utc(first_buy_at)
+    call = _as_utc(called_at)
+    if buy is None or call is None:
+        return False
+    return (call - EARLY_BEFORE_CALL) <= buy <= (call + EARLY_AFTER_CALL)
+
+
+def identity_trap(trader):
+    """True for bot, pool, developer, exchange, hacker, or spam-dusting labels.
+
+    axiom, photon, fomo, gmgn, bloom, and terminal are trading frontends.
+    They are not traps. A gmgn identity tag is not tracked_wallets source=gmgn.
+    """
+    if not isinstance(trader, dict):
+        return False
+    identity = trader.get("identity")
+    if not isinstance(identity, dict):
+        identity = {}
+    labels = set()
+    if identity.get("type"):
+        labels.add(str(identity.get("type")).strip().lower())
+    for tag in _identity_tags(trader):
+        labels.add(str(tag).strip().lower())
+    platforms = identity.get("platforms") or []
+    if isinstance(platforms, str):
+        platforms = [platforms]
+    if isinstance(platforms, list):
+        for platform in platforms:
+            if platform is not None:
+                labels.add(str(platform).strip().lower())
+    if labels & _TRAP_LABELS:
+        return True
+    for key in _TRAP_OBJECTS:
+        if identity.get(key):
+            return True
+    return False
+
+
+def is_copy_ok(won, early, hold_secs, career_tokens, career_trades, trap):
+    """Won, early, held at least a minute, and not a career or identity bot.
+
+    Null career counts are unknown, not a bot. A missing hold is not copyable.
+    """
+    if not won or not early or trap:
+        return False
+    if not isinstance(hold_secs, Decimal) or hold_secs < MIN_HOLD_SECS:
+        return False
+    if career_tokens is not None and career_tokens >= CAREER_TOKENS_MAX:
+        return False
+    if career_trades is not None and career_trades >= CAREER_TRADES_MAX:
+        return False
+    return True
+
+
+def position_row(trader, mint, called_at=None):
     wallet = str(trader.get("wallet") or "").strip()
     realized = dec(dig(trader, "pnl", "token", "realized"))
     invested = dec(trader.get("invested", trader.get("buyUsd")))
     proceeds = dec(trader.get("proceeds", trader.get("sellUsd")))
+    hold = dec(dig(trader, "timing", "holdTimeSecs"))
+    first_buy = epoch_to_utc(
+        dig(trader, "timing", "firstBuy") or dig(trader, "timing", "firstTrade")
+    )
+    last_sell = epoch_to_utc(
+        dig(trader, "timing", "lastSell") or dig(trader, "timing", "lastTrade")
+    )
+    career_trades = _as_int(dig(trader, "pnl", "wallet", "totalTrades"))
+    career_tokens = _as_int(dig(trader, "pnl", "wallet", "tokensTraded"))
+    won = realized is not None and realized > 0
+    early = is_early(first_buy, called_at)
+    trap = identity_trap(trader)
+    copy_ok = is_copy_ok(won, early, hold, career_tokens, career_trades, trap)
     return (
         wallet, mint, 0, realized, invested, proceeds, dec(trader.get("roi")),
         dig(trader, "counts", "buys"), dig(trader, "counts", "sells"),
-        None, None, dec(dig(trader, "timing", "holdTimeSecs")),
-        dig(trader, "pnl", "wallet", "totalTrades"),
-        dig(trader, "pnl", "wallet", "tokensTraded"),
+        first_buy, last_sell, hold,
+        career_trades, career_tokens,
         dec(dig(trader, "pnl", "wallet", "realized")),
         dig(trader, "identity", "type"), _identity_tags(trader),
-        "tracker_traders", True, False, False,
+        "tracker_traders", won, copy_ok, early,
     )
 
 
-def rows_from_traders(traders, mint):
+def rows_from_traders(traders, mint, called_at=None):
     """Build position rows. One bad wallet is logged and skipped.
 
     The second value is how many traders raised. A page of only failures
@@ -949,7 +1233,7 @@ def rows_from_traders(traders, mint):
         try:
             if not _keep_trader(trader):
                 continue
-            row = position_row(trader, mint)
+            row = position_row(trader, mint, called_at)
             wallet = row[0] or wallet
             if not row[0] or row[0] in seen:
                 continue
@@ -1035,14 +1319,21 @@ def upsert_positions(conn, cur, rows, mint, sleep=None):
         return written
 
 
-def harvest_one(conn, cur, key, outcome_id, mint, roi, sleep=None):
+def _flag_count(rows, index):
+    return sum(1 for row in rows if len(row) > index and row[index])
+
+
+def harvest_one(conn, cur, key, outcome_id, mint, roi, called_at=None, sleep=None):
     """Harvest one mint. Raises FatalLedger only when the ledger cannot be written."""
     try:
         with httpx.Client() as client:
             traders, pages = fetch(client, key, mint, sleep=sleep)
-        rows, failures = rows_from_traders(traders, mint)
+        rows, failures = rows_from_traders(traders, mint, called_at)
         written = upsert_positions(conn, cur, rows, mint, sleep=sleep)
         green = _green(written)
+        early_n = _flag_count(written, COL_EARLY)
+        copy_n = _flag_count(written, COL_COPY_OK)
+        log.info("mint=%s early=%s copy_ok=%s", mint, early_n, copy_n)
         if written:
             status = "ok"
         elif failures or rows:
@@ -1083,12 +1374,58 @@ def harvest_one(conn, cur, key, outcome_id, mint, roi, sleep=None):
         return "error"
 
 
+def _fetch_int(cur, sql, params=None):
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    if not row or row[0] is None:
+        return 0
+    return int(row[0])
+
+
+def log_discovery_summary(cur, harvest_rows, promote_activated):
+    """One line per run. Counts are tracker_traders rows only."""
+    kept = total = copy_ok = 0
+    try:
+        cur.execute(SUMMARY_SQL)
+        row = cur.fetchone()
+        if row:
+            kept = int(row[0] or 0)
+            total = int(row[1] or 0)
+            copy_ok = int(row[2] or 0)
+    except Exception as exc:
+        log.error("status=error reason=%s phase=summary", type(exc).__name__)
+    log.info(
+        "discovery summary scanned_mints_kept=%s positions_total=%s "
+        "positions_copy_ok=%s harvest_rows=%s promote_activated=%s",
+        kept, total, copy_ok, harvest_rows, promote_activated,
+    )
+
+
+def select_backfill(cur, sleep=None):
+    """Re-score the newest ledgered mints that have no first_buy_at yet."""
+    limit = backfill_limit()
+
+    def _rows():
+        cur.execute(BACKFILL_SQL, (limit,))
+        return cur.fetchall()
+
+    chosen = list(retry_call(_rows, sleep=sleep, label="backfill mints"))
+    log.info(
+        "backfill selected chosen=%s limit=%s",
+        len(chosen), limit,
+    )
+    if not chosen:
+        log.info("no unscanned mint; exit 0 reason=positions_already_scored")
+    return chosen, len(chosen)
+
+
 def select_mints(cur, mint_override, fraction, rescan, sleep=None, now=None):
     """Return (chosen_rows, ranked_count). Empty chosen means exit 0.
 
     The scheduled batch is the top fraction of distinct tokens whose outcomes
     fall inside the rolling window (default 10 hours). Collapse happens before
-    the cut. A mint override still targets that one mint.
+    the cut. A mint override still targets that one mint. Backfill replaces
+    the quintile for one start and only refills mints missing scored positions.
     """
     if mint_override:
         def _status():
@@ -1125,6 +1462,9 @@ def select_mints(cur, mint_override, fraction, rescan, sleep=None, now=None):
             return [], 0
         return [choice + (status,)], 1
 
+    if backfill_enabled():
+        return select_backfill(cur, sleep=sleep)
+
     hours = window_hours()
     moment = now or datetime.now(timezone.utc)
 
@@ -1152,34 +1492,47 @@ def select_mints(cur, mint_override, fraction, rescan, sleep=None, now=None):
 
 
 def sync_tracked_wallets(conn, cur, sleep=None):
-    """Insert tracker winners inactive, then apply the existing promote cap.
+    """Upsert copy_ok tracker wallets and set is_active=true inside the cap.
 
-    is_active stays false on insert. The promote update only turns on wallets
-    that already qualify inside v_repeat_winners, capped at PROMOTE_CAP.
-    A larger mint batch does not loosen that rule.
+    is_active is set in SQL for source='tracker_traders' only. source=gmgn
+    is not updated. N is 2 when two mints already have a copy_ok row, else 1
+    with the stronger single-mint gate. The cap defaults to 100.
     """
     try:
+        def _scored():
+            return _fetch_int(cur, COPY_OK_MINTS_SQL)
+
+        scored = retry_call(_scored, sleep=sleep, label="copy_ok mints")
+        min_mints = repeat_mint_threshold(scored)
+        cap = promote_cap()
+
         def _harvest():
-            cur.execute(HARVEST_SQL)
+            cur.execute(harvest_sql(min_mints, cap))
             return cur.rowcount
 
         harvested = retry_call(_harvest, sleep=sleep, label="harvest tracked_wallets")
         conn.commit()
         log.info(
-            "harvest summary rows=%s source=tracker_traders",
-            harvested,
+            "harvest summary rows=%s source=tracker_traders min_mints=%s",
+            harvested, min_mints,
         )
 
         def _promote():
-            cur.execute(PROMOTE_SQL)
+            cur.execute(promote_sql(min_mints, cap))
             return cur.rowcount
 
         promoted = retry_call(_promote, sleep=sleep, label="promote tracked_wallets")
         conn.commit()
         log.info(
             "promote summary cap=%s rows_updated=%s source=tracker_traders",
-            PROMOTE_CAP, promoted,
+            cap, promoted,
         )
+
+        def _activated():
+            return _fetch_int(cur, ACTIVATED_SQL)
+
+        activated = retry_call(_activated, sleep=sleep, label="promote activated")
+        log_discovery_summary(cur, harvested, activated)
         return 0
     except Exception as exc:
         log.error(
@@ -1210,6 +1563,7 @@ def run_harvest(conn, mint_override, sleep=None, now=None):
             return 1
         return 0
     if not chosen:
+        log_discovery_summary(cur, 0, 0)
         return 0
     shown_fraction = "override" if mint_override else fraction
     shown_window = "override" if mint_override else window_hours()
@@ -1231,12 +1585,14 @@ def run_harvest(conn, mint_override, sleep=None, now=None):
             "mint=%s status=error reason=SOLANA_TRACKER_API_KEY_unset",
             chosen[0][1],
         )
+        log_discovery_summary(cur, 0, 0)
         return 1
     counts = {"ok": 0, "empty": 0, "error": 0}
-    for outcome_id, mint, roi, _message_timestamp, _status in chosen:
+    for outcome_id, mint, roi, message_timestamp, _status in chosen:
         try:
             status = harvest_one(
-                conn, cur, key, outcome_id, mint, roi, sleep=sleep,
+                conn, cur, key, outcome_id, mint, roi,
+                called_at=message_timestamp, sleep=sleep,
             )
         except FatalLedger as exc:
             log.error(
@@ -1247,6 +1603,7 @@ def run_harvest(conn, mint_override, sleep=None, now=None):
                 "batch summary selected=%s ok=%s empty=%s error=%s",
                 len(chosen), counts["ok"], counts["empty"], counts["error"] + 1,
             )
+            log_discovery_summary(cur, 0, 0)
             return 1
         counts[status] = counts.get(status, 0) + 1
     log.info(

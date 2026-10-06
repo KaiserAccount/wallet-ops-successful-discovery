@@ -8,7 +8,7 @@ Every 8 hours, harvest the top 20% of distinct tokens whose outcomes are within 
 2. Skip mints already ledgered `ok` or `empty` unless `DISCOVER_RESCAN` is set. `status=error` stays eligible.
 3. For each chosen mint, call Solana Tracker traders and upsert profitable wallets into `wallet_intel.wallet_token_positions`. One mint's failure is logged and skipped.
 4. Insert or update `wallet_intel.token_trader_scans` (`ok`, `empty`, or `error`).
-5. Harvest repeat winners into `public.tracked_wallets` inactive (`is_active=false`), then promote at most 100 tracker wallets under the existing `v_repeat_winners` rule. A larger mint batch does not activate wallets.
+5. Harvest wallets that are `copy_ok` on enough mints into `public.tracked_wallets` with `source='tracker_traders'` and `is_active=true`. The promote update touches only that source (never `gmgn`) and keeps at most `DISCOVER_PROMOTE_CAP` (default 100) active. See README for the early / copy_ok rules. Positions for other mints are not deleted.
 
 Each cron start runs that list once and exits. `DISCOVER_TEST` only labels a one-shot check; it does not gate the harvest. See the sequence below.
 
@@ -75,8 +75,10 @@ upsert progress rows=20 green_usd=1500
 mint=<mint> pages=2 upserted=20 green_usd=1500 status=ok
 mint=<mint> status=error reason=TimeoutException phase=harvest
 batch summary selected=8 ok=7 empty=0 error=1
-harvest summary rows=3 source=tracker_traders
+mint=<mint> early=4 copy_ok=2
+harvest summary rows=3 source=tracker_traders min_mints=2
 promote summary cap=100 rows_updated=100 source=tracker_traders
+discovery summary scanned_mints_kept=6 positions_total=900 positions_copy_ok=40 harvest_rows=3 promote_activated=3
 ```
 
 Connect lines include host, port, user, and hostaddr only. A skip or failure names `reason=` (`already_scanned`, `no_unscanned_mint`, `top_quintile_already_scanned`, `SOLANA_TRACKER_API_KEY_unset`, `connect failed reason=...`). Tracker and mint failures log the exception type, not the message, so the API key cannot be echoed. ERROR lines use the same stdout handler as the INFO progress lines.
@@ -100,7 +102,7 @@ Completed ledger rows (`token_trader_scans.status` of `ok` or `empty`) inside th
 | `telegram_call_outcomes.roi_multiple` | Distinct tokens inside the last 10 hours | This is the quintile. |
 | Solana Tracker traders (`sort=realized`) | Wallets inside one mint, by realized PnL, with a $50 floor | Applied after the mint is chosen. |
 | Tracker `/tokens/volume` and `/tokens/trending` | About 100 tokens by volume; pool objects include liquidity | A different universe from the success book. Not stored by this job. |
-| `wallet_intel.v_repeat_winners` (`n_won`, `pnl_won`) | Wallets for the promote cap of 100 | Does not choose mints. Inserts stay `is_active=false` until this view's existing rule turns them on. |
+| `copy_ok` across distinct mints | Wallets for the promote cap (default 100) | Does not choose mints. `tracker_traders` rows are written `is_active=true`. `source=gmgn` is never activated. |
 
 This service's selection SQL reads `id`, `token_address`, `roi_multiple`, `message_timestamp`, and the scan `status`. `detected_at` is not read. A live column listing of the book timed out from the audit environment, so no extra volume or liquidity column was confirmed on `telegram_call_outcomes`. None is referenced by the harvest.
 
@@ -116,7 +118,7 @@ What the audit found, and what a run does now:
 | `token_trader_scans` insert | `ON CONFLICT DO NOTHING`, and `status=error` was never written. A crash left no ledger row. | Upsert updates the scan. `error` is written when the mint fails and the table is writable. A later success replaces `error`. |
 | Missing table, privilege error, or dead connection while writing the ledger | Exit 1, often as an unhandled exception. | Still exit 1 (`phase=fatal`). Later mints are not attempted. |
 | Connect failure, or `SOLANA_TRACKER_API_KEY` unset | Exit 1. | Still exit 1. The key failure happens before any Tracker call. |
-| Promote / `tracked_wallets` write after a partial batch | Never reached if the single mint raised. | Runs after the batch. Inserts still use `is_active=false`. Promote still caps at 100 `v_repeat_winners`. A promote failure is logged; it exits 1 only when the ledger class of error or a dead connection is what failed. |
+| Promote / `tracked_wallets` write after a partial batch | Never reached if the single mint raised. | Runs after the batch. Inserts set `is_active=true` for `source=tracker_traders` only. Promote caps that source (default 100) and does not update `gmgn`. A promote failure is logged; it exits 1 only when the ledger class of error or a dead connection is what failed. |
 
 Passwords, API keys, and full DSNs are not logged. Tracker failures log the exception type only.
 
